@@ -1,4 +1,4 @@
-# frostbyte
+# FROSTBYTE
 # DataLens — AI-Powered Natural Language Data Analytics
 
 DataLens is an open-source AI-powered platform designed to simplify data analysis using natural-language questions.
