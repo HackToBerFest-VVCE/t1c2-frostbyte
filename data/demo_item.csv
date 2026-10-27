@@ -1,0 +1,25 @@
+i_item_sk,i_item_id,i_product_name,i_item_desc,i_category,i_brand,i_class,i_current_price,i_wholesale_cost
+1,PROD-101,UltraHD 4K Smart OLED TV 65-inch,UltraHD 4K Smart OLED TV 65-inch,Electronics,ApexTech,electronics,1299.99,714.99
+2,PROD-102,Noise-Cancelling Wireless Pro Headphones,Noise-Cancelling Wireless Pro Headphones,Electronics,SoundWave,electronics,249.99,137.49
+3,PROD-103,Titan Gaming Laptop 16GB RTX 4070,Titan Gaming Laptop 16GB RTX 4070,Electronics,ApexTech,electronics,1799.5,989.73
+4,PROD-104,Smart Fitness & Health Tracker Band,Smart Fitness & Health Tracker Band,Electronics,PulseFit,electronics,89.95,49.47
+5,PROD-105,True Wireless Studio Earbuds,True Wireless Studio Earbuds,Electronics,SoundWave,electronics,129.0,70.95
+6,PROD-106,Ultra-Wide Curved Productivity Monitor 34-inch,Ultra-Wide Curved Productivity Monitor 34-inch,Electronics,ApexTech,electronics,499.0,274.45
+7,PROD-201,Premium All-Weather Gore-Tex Parka,Premium All-Weather Gore-Tex Parka,Apparel,NorthSummit,apparel,280.0,154.0
+8,PROD-202,Organic Cotton Slim-Fit Chinos,Organic Cotton Slim-Fit Chinos,Apparel,UrbanLoom,apparel,65.0,35.75
+9,PROD-203,Merino Wool Thermal Crewneck Sweater,Merino Wool Thermal Crewneck Sweater,Apparel,NordicWeave,apparel,115.0,63.25
+10,PROD-204,Performance Moisture-Wicking Running Shoes,Performance Moisture-Wicking Running Shoes,Apparel,Stride,apparel,140.0,77.0
+11,PROD-205,Classic Tailored Italian Wool Blazer,Classic Tailored Italian Wool Blazer,Apparel,Sartorial,apparel,320.0,176.0
+12,PROD-301,Precision Espresso Machine & Grinder Combo,Precision Espresso Machine & Grinder Combo,Home & Kitchen,BaristaPro,home_&_kitchen,699.0,384.45
+13,PROD-302,Multi-Cooker Air Fryer Deluxe 8-in-1,Multi-Cooker Air Fryer Deluxe 8-in-1,Home & Kitchen,CuisineMaster,home_&_kitchen,159.99,87.99
+14,PROD-303,Cordless Smart Robotic Vacuum & Mop,Cordless Smart Robotic Vacuum & Mop,Home & Kitchen,CleanBot,home_&_kitchen,450.0,247.5
+15,PROD-304,Cast Iron Enamelled Dutch Oven 6-Quart,Cast Iron Enamelled Dutch Oven 6-Quart,Home & Kitchen,HeritageCook,home_&_kitchen,135.0,74.25
+16,PROD-305,Ergonomic Memory Foam Cooling Pillow,Ergonomic Memory Foam Cooling Pillow,Home & Kitchen,CloudRest,home_&_kitchen,55.0,30.25
+17,PROD-401,Modern Data Architecture with Cloud Warehouses,Modern Data Architecture with Cloud Warehouses,Books,TechPress,books,48.0,26.4
+18,PROD-402,Designing AI Agents & Foundation Models,Designing AI Agents & Foundation Models,Books,TechPress,books,54.0,29.7
+19,PROD-403,The Art of Financial Forecasting,The Art of Financial Forecasting,Books,GuildPub,books,35.0,19.25
+20,PROD-404,Gourmet Artisan Sourdough Masterclass,Gourmet Artisan Sourdough Masterclass,Books,CulinaryArts,books,29.99,16.49
+21,PROD-501,Aerodynamic Carbon Gravel Bike,Aerodynamic Carbon Gravel Bike,Sports,Veloce,sports,2250.0,1237.5
+22,PROD-502,Ultralight 2-Person Backpacking Tent,Ultralight 2-Person Backpacking Tent,Sports,NorthSummit,sports,210.0,115.5
+23,PROD-503,Adjustable Quick-Select Dumbbell Set 50lb,Adjustable Quick-Select Dumbbell Set 50lb,Sports,IronCore,sports,349.0,191.95
+24,PROD-504,Inflatable Stand-Up Touring Paddleboard,Inflatable Stand-Up Touring Paddleboard,Sports,AquaGlide,sports,395.0,217.25
