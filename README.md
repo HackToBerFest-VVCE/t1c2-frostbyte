@@ -1,12 +1,15 @@
-# DataLens Live — Real-Time Snowflake Analytics Prototype
+# FROSTBYTE
+# DataLens Live — AI-Powered Natural Language Snowflake Analytics
 
-DataLens Live is a real-time analytics prototype connecting Streamlit directly to **Snowflake** (`SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL` / `TPCDS_SF100TCL`) and pairing it with a local **Qwen3-4B** LLM via Ollama to enable natural-language business intelligence without synthetic or simulated data.
+> **Developed by Team FrostByte for Challenge B: Best Open-Source AI Project with Snowflake.**
+
+DataLens Live is an open-source, real-time analytics platform designed to simplify data exploration using natural-language questions without requiring advanced SQL knowledge. It connects Streamlit directly to **Snowflake** (`SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL` / `TPCDS_SF100TCL`) and pairs it with a locally hosted **Qwen3-4B** model via Ollama to deliver dynamic business intelligence, interactive visualizations, and plain-English insights without synthetic or simulated data.
 
 ---
 
 ## 🎨 Hackathon Color Palette
 
-DataLens Live implements a modern, accessible palette:
+DataLens Live implements a modern, accessible theme:
 - **Background**: `#EEF2FF`
 - **Cards & Surfaces**: `#FFFFFF`
 - **Primary Blue**: `#4169E1`
@@ -153,3 +156,7 @@ t1c2-frostbyte/
     ├── 3_Product_Analysis.py       # Product & category leaderboard
     └── 4_Data_Explorer.py          # Live schema inspector & safe SQL console
 ```
+
+---
+
+Developed by Team FrostByte for Challenge B: Best Open-Source AI Project with Snowflake.
