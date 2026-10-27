@@ -1,235 +1,235 @@
-"""
-Ask DataLens — Natural-Language Analytics Powered by Qwen3-4B & Snowflake.
-Translates user questions into validated SQL, executes against Snowflake/Demo,
-and displays interactive visualisations and plain-English explanations.
+"""Ask DataLens — Natural-Language Analytics Powered by Ollama Qwen3-4B.
+
+Pipeline:
+Question -> Qwen3-4B -> SQL Generation -> SQL Validation -> Snowflake Execution -> Results Table -> Plotly Visual -> Plain-English Explanation
 """
 
-from datetime import datetime
 import streamlit as st
 import pandas as pd
-from utils.config import get_custom_css, COLORS, APP_NAME
-from components.sidebar import render_sidebar
-from components.metric_cards import render_demo_banner
-from components.charts import render_generic_chart
-from services.qwen_service import qwen_service
-from services.sql_validator import SQLValidator
-from services.snowflake_service import snowflake_service
-from utils.formatting import format_duration
+import plotly.express as px
 
-# Page Setup
+from services.ui_theme import (
+    apply_theme,
+    render_hero_banner,
+    apply_plotly_theme,
+    COLOR_PRIMARY_BLUE,
+    COLOR_PURPLE,
+    COLOR_DARK_NAVY,
+    COLOR_CARD,
+    COLOR_BORDER,
+)
+from services.snowflake_service import (
+    test_connection,
+    execute_snowflake_query,
+    get_snowflake_config,
+    DEFAULT_DATABASE,
+    DEFAULT_SCHEMA,
+)
+from services.sql_validator import validate_and_sanitize_sql
+from services.qwen_service import (
+    check_ollama_status,
+    generate_sql_query,
+    explain_query_results,
+    DEFAULT_MODEL,
+)
+
 st.set_page_config(
-    page_title=f"Ask DataLens — {APP_NAME}",
+    page_title="Ask DataLens — Natural Language Analytics",
     page_icon="💬",
     layout="wide",
 )
-st.markdown(get_custom_css(), unsafe_allow_html=True)
-render_sidebar(active_page="Ask DataLens")
+apply_theme()
 
-# Initialize Session State
-if "query_history" not in st.session_state:
-    st.session_state["query_history"] = []
+# Connection check
+cfg = get_snowflake_config()
+is_connected = False
+if cfg:
+    is_connected, _, _ = test_connection()
 
-if "active_question" not in st.session_state:
-    st.session_state["active_question"] = ""
+active_db = cfg.get("database", DEFAULT_DATABASE) if cfg else DEFAULT_DATABASE
+active_sch = cfg.get("schema", DEFAULT_SCHEMA) if cfg else DEFAULT_SCHEMA
 
-# Header
-st.markdown(
-    f"""
-    <div>
-        <h1 style="font-size: 2rem; font-weight: 800; color: {COLORS['text']}; margin: 0;">
-            💬 Ask DataLens
-        </h1>
-        <p style="font-size: 0.95rem; color: #64748B; margin-top: 4px; margin-bottom: 20px;">
-            Ask questions in plain English. <b>Qwen3-4B</b> converts your inquiry into secure SQL, runs it through Snowflake, and visualises the answers.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+render_hero_banner(
+    title="Ask DataLens",
+    subtitle="AI-driven Natural Language to Snowflake Analytics powered by local Qwen3-4B",
+    data_source=f"{active_db}.{active_sch}",
+    connected=is_connected
 )
 
-# Example questions list
-EXAMPLES = [
-    "Which products generated the highest sales?",
-    "What are the top 10 best-selling products?",
-    "Which month had the highest sales?",
-    "Which product categories perform best?",
-    "How do store, web, and catalog sales compare?",
-    "What is the average quantity sold per product?",
+# Check Ollama status
+ollama_ok, ollama_msg, available_models = check_ollama_status()
+if not ollama_ok:
+    st.error(f"⚠️ **Ollama Service Unavailable**: {ollama_msg}")
+    st.info("Make sure the Ollama application is running and `qwen3:4b` is installed.")
+
+# Quick sample question buttons
+st.markdown("##### 💡 Suggested Questions")
+sample_questions = [
+    "What are the total sales?",
+    "Which products generate the highest sales?",
+    "What is the total quantity sold?",
+    "Compare store and web sales.",
+    "Show sales trends by date.",
 ]
 
-# Quick Example Chips
-st.markdown("<p style='font-size: 0.82rem; font-weight: 700; color: #64748B; text-transform: uppercase; margin-bottom: 6px;'>💡 Example Questions (click to load)</p>", unsafe_allow_html=True)
+cols = st.columns(len(sample_questions))
+selected_sample = None
+for i, sq in enumerate(sample_questions):
+    with cols[i]:
+        if st.button(sq, key=f"sq_{i}", use_container_width=True):
+            selected_sample = sq
 
-cols = st.columns(3)
-for idx, ex in enumerate(EXAMPLES):
-    col = cols[idx % 3]
-    if col.button(f"🔍 {ex}", key=f"ex_{idx}", use_container_width=True):
-        st.session_state["active_question"] = ex
-        st.rerun()
+# Question input form
+user_input = st.text_input(
+    "Ask a question in plain English:",
+    value=selected_sample if selected_sample else "",
+    placeholder="e.g. Which products generate the highest sales in store_sales?",
+    help="Type any business question regarding sales, products, categories, or trends."
+)
 
-st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+run_button = st.button("🚀 Analyze Question", type="primary")
 
-# Question Input Form
-with st.form(key="ask_form", clear_on_submit=False):
-    user_question = st.text_input(
-        label="Natural-Language Analytics Query:",
-        value=st.session_state.get("active_question", ""),
-        placeholder="Ask anything about your retail sales data...",
-        help="Type any analytical retail question about sales, products, categories, or channels.",
-    )
-    col_submit, col_clear = st.columns([1, 5])
-    with col_submit:
-        submitted = st.form_submit_button("⚡ Run Analytics", use_container_width=True)
+if run_button or selected_sample:
+    if not user_input.strip():
+        st.warning("Please enter or select a question to analyze.")
+        st.stop()
 
-if submitted and user_question.strip():
-    q_text = user_question.strip()
-    st.session_state["active_question"] = q_text
+    if not ollama_ok:
+        st.error("Cannot proceed: Qwen3-4B model on Ollama is not available.")
+        st.stop()
 
     st.markdown("---")
-    
-    # 1. Step: Generate SQL with Qwen3-4B
-    with st.status(f"Analyzing question with Qwen3-4B...", expanded=True) as status_box:
-        st.write("1. 🧠 Submitting question & schema context to Qwen3-4B...")
-        ai_resp = qwen_service.generate_sql(q_text)
-        raw_sql = ai_resp.get("sql", "")
-        explanation = ai_resp.get("explanation", "")
-        is_simulated = ai_resp.get("is_simulated", False)
-        model_name = ai_resp.get("model_name", "Qwen3-4B")
+    st.markdown(f"### 🔍 Analysis for: *\"{user_input.strip()}\"*")
 
-        if is_simulated:
-            st.info(f"ℹ️ {ai_resp.get('error', 'Using deterministic Qwen3-4B engine')}")
+    # Step 1: SQL Generation via Qwen3-4B
+    with st.status("🧠 Step 1: Generating Snowflake SQL with Qwen3-4B...", expanded=True) as status:
+        sql_query, thinking, gen_err = generate_sql_query(user_input)
+        if gen_err:
+            status.update(label="❌ SQL Generation Failed", state="error")
+            st.error(gen_err)
+            st.stop()
+        
+        status.update(label="✅ SQL Query Generated Successfully", state="complete")
 
-        st.write("2. 🛡️ Running security validation layer...")
-        is_valid, validation_err, sanitized_sql = SQLValidator.validate(raw_sql)
+    if thinking:
+        with st.expander("💭 View Qwen3-4B Chain-of-Thought Reasoning", expanded=False):
+            st.markdown(f"```\n{thinking}\n```")
 
+    st.markdown("##### 📝 Generated SQL Query")
+    st.code(sql_query, language="sql")
+
+    # Step 2: SQL Validation and Safety Enforcement
+    with st.status("🛡️ Step 2: Validating SQL Security & Permissions...", expanded=True) as status:
+        is_valid, sanitized_sql, val_err = validate_and_sanitize_sql(sql_query, default_limit=100)
         if not is_valid:
-            status_box.update(label="Query Rejected by SQL Security Validator", state="error", expanded=True)
-            st.error(f"❌ Security Policy Rejection: {validation_err}")
-            
-            # Log failed validation into history
-            st.session_state["query_history"].insert(
-                0,
-                {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "question": q_text,
-                    "status": "Rejected",
-                    "duration": 0.0,
-                    "sql": raw_sql,
-                    "rows": 0,
-                    "is_demo": True,
-                },
-            )
+            status.update(label="❌ SQL Validation Rejected Query", state="error")
+            st.error(f"**Safety Violation:** {val_err}")
             st.stop()
+        
+        status.update(label="✅ SQL Security Checks Passed (Read-only, allowlist verified, LIMIT applied)", state="complete")
 
-        st.write("3. ❄️ Executing approved SQL query...")
-        df_results, exec_time, is_demo, exec_err = snowflake_service.execute_query(sanitized_sql)
+    # Display sanitized SQL if it changed
+    if sanitized_sql.strip() != sql_query.strip():
+        with st.expander("🛡️ View Sanitized & Formatted SQL", expanded=False):
+            st.code(sanitized_sql, language="sql")
 
-        if exec_err and df_results.empty:
-            status_box.update(label="Query Execution Failed", state="error", expanded=True)
-            st.error(f"Database Error: {exec_err}")
-            st.session_state["query_history"].insert(
-                0,
-                {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "question": q_text,
-                    "status": "Error",
-                    "duration": exec_time,
-                    "sql": sanitized_sql,
-                    "rows": 0,
-                    "is_demo": is_demo,
-                },
-            )
-            st.stop()
-
-        status_box.update(label=f"Analysis Complete! ({format_duration(exec_time)})", state="complete", expanded=False)
-
-    # Log successful execution into history
-    st.session_state["query_history"].insert(
-        0,
-        {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "question": q_text,
-            "status": "Success",
-            "duration": exec_time,
-            "sql": sanitized_sql,
-            "rows": len(df_results),
-            "is_demo": is_demo,
-        },
-    )
-
-    # Mandatory Demo Banner if demo engine was utilized
-    render_demo_banner(is_demo)
-
-    # Explanation Card
-    st.markdown(
-        f"""
-        <div class="datalens-card" style="border-left: 4px solid {COLORS['highlight']}; margin-bottom: 20px;">
-            <div style="font-size: 0.8rem; font-weight: 700; color: {COLORS['highlight']}; text-transform: uppercase; margin-bottom: 4px;">
-                💡 Plain-English Summary ({model_name})
-            </div>
-            <div style="font-size: 1.05rem; color: {COLORS['text']}; line-height: 1.5; font-weight: 500;">
-                {explanation}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Results Visualisation & Data Table Tabs
-    tab_chart, tab_data, tab_sql = st.tabs(["📊 Interactive Visualisation", "📋 Query Results Table", "🔍 Generated SQL"])
-
-    with tab_chart:
-        if not df_results.empty and len(df_results.columns) >= 2:
-            fig = render_generic_chart(df_results, question_hint=q_text)
-            st.plotly_chart(fig, use_container_width=True)
-        elif df_results.empty:
-            st.warning("Query returned zero rows matching your criteria.")
-        else:
-            # Single scalar metric
-            val = df_results.iloc[0, 0]
-            st.metric(label=df_results.columns[0].replace("_", " ").title(), value=f"{val}")
-
-    with tab_data:
-        st.markdown(f"**Rows returned:** {len(df_results)} | **Execution duration:** {format_duration(exec_time)}")
-        # Format currency & numbers in preview table
-        formatted_df = df_results.copy()
-        st.dataframe(formatted_df, use_container_width=True)
-
-        # Download CSV button
-        csv_bytes = df_results.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download Results as CSV",
-            data=csv_bytes,
-            file_name=f"datalens_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
+    # Step 3: Snowflake Execution
+    if not is_connected:
+        st.warning(
+            "⚠️ **Snowflake connection is not configured or offline.**\n\n"
+            "The SQL query was generated and validated, but cannot be executed against live Snowflake data. "
+            "Please configure `.streamlit/secrets.toml` to view live query results."
         )
+        st.stop()
 
-    with tab_sql:
+    with st.status("⚡ Step 3: Executing Query against Snowflake...", expanded=True) as status:
+        df, exec_time, exec_err = execute_snowflake_query(sanitized_sql, max_rows=100)
+        if exec_err:
+            status.update(label="❌ Snowflake Execution Failed", state="error")
+            st.error(exec_err)
+            st.stop()
+        
+        status.update(label=f"✅ Snowflake Query Executed in {exec_time}s ({len(df) if df is not None else 0} rows)", state="complete")
+
+    if df is None or df.empty:
+        st.info("The query returned 0 rows from Snowflake.")
+        st.stop()
+
+    # Step 4: Results Table
+    st.markdown("##### 📊 Query Results Table")
+    st.dataframe(df, use_container_width=True)
+
+    # Step 5: Dynamic Plotly Visualization
+    st.markdown("##### 📈 Interactive Visualization")
+    try:
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
+
+        if len(df) == 1 and len(numeric_cols) >= 1:
+            # Single KPI metric card
+            val = df[numeric_cols[0]].iloc[0]
+            col_name = numeric_cols[0].replace("_", " ").title()
+            val_str = f"${val:,.2f}" if "sales" in numeric_cols[0].lower() or "price" in numeric_cols[0].lower() else f"{val:,}"
+            st.metric(label=col_name, value=val_str)
+        
+        elif len(non_numeric_cols) >= 1 and len(numeric_cols) >= 1:
+            cat_col = non_numeric_cols[0]
+            val_col = numeric_cols[0]
+
+            # Detect if category is a date
+            is_date = "date" in cat_col.lower() or "day" in cat_col.lower()
+            if is_date:
+                fig = px.line(
+                    df,
+                    x=cat_col,
+                    y=val_col,
+                    title=f"{val_col.replace('_', ' ').title()} over {cat_col.replace('_', ' ').title()}",
+                    color_discrete_sequence=[COLOR_PRIMARY_BLUE]
+                )
+                fig.update_traces(mode="lines+markers")
+            else:
+                # Bar chart
+                fig = px.bar(
+                    df.head(20),
+                    x=cat_col,
+                    y=val_col,
+                    title=f"{val_col.replace('_', ' ').title()} by {cat_col.replace('_', ' ').title()}",
+                    color_discrete_sequence=[COLOR_PRIMARY_BLUE, COLOR_PURPLE]
+                )
+            apply_plotly_theme(fig, height=380)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        elif len(numeric_cols) >= 2:
+            fig = px.bar(
+                df.head(20),
+                x=numeric_cols[0],
+                y=numeric_cols[1],
+                color_discrete_sequence=[COLOR_PRIMARY_BLUE]
+            )
+            apply_plotly_theme(fig, height=380)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("Results rendered in tabular format.")
+    except Exception as viz_err:
+        st.caption(f"Note: Standard chart could not be generated ({str(viz_err)}). Data displayed in table above.")
+
+    # Step 6: Plain-English Business Explanation by Qwen3-4B
+    st.markdown("##### 🗣️ Plain-English Business Summary")
+    with st.spinner("Generating AI executive explanation..."):
+        # Create a compact summary string of the results
+        summary_rows = df.head(5).to_dict(orient="records")
+        summary_text = f"Total rows: {len(df)}. Top rows: {summary_rows}"
+        explanation, exp_err = explain_query_results(user_input, sanitized_sql, summary_text)
+    
+    if exp_err:
+        st.warning(f"Could not generate AI explanation: {exp_err}")
+    elif explanation:
         st.markdown(
             f"""
-            <div style="font-size: 0.85rem; color: #64748B; margin-bottom: 8px;">
-                <b>Validated SQL</b> generated by <code>{model_name}</code>:
+            <div class="datalens-card" style="border-left: 4px solid {COLOR_PURPLE}; background: #FAF5FF;">
+                <div style="font-weight: 600; color: #6B21A8; margin-bottom: 0.35rem;">💡 Business Analyst Takeaway:</div>
+                <div style="color: {COLOR_DARK_NAVY}; font-size: 0.98rem; line-height: 1.5;">{explanation}</div>
             </div>
             """,
-            unsafe_allow_html=True,
+            unsafe_allow_html=True
         )
-        st.code(sanitized_sql, language="sql")
-        st.caption("All queries pass through SQLValidator to ensure read-only safety, schema enforcement, and row limit clamping.")
-
-elif not user_question.strip():
-    # Empty State Guidance
-    st.markdown(
-        f"""
-        <div class="datalens-card" style="text-align: center; padding: 48px 24px; margin-top: 20px;">
-            <div style="font-size: 2.5rem; margin-bottom: 12px;">🔍</div>
-            <h3 style="font-weight: 700; color: {COLORS['text']}; margin-bottom: 8px;">Ready for your inquiry</h3>
-            <p style="font-size: 0.95rem; color: #64748B; max-width: 550px; margin: 0 auto 18px auto;">
-                Select one of the suggested example queries above, or formulate your own question about revenue, customer habits, products, or channels.
-            </p>
-            <div style="font-size: 0.8rem; color: #94A3B8;">
-                Powered by <b>Qwen3-4B</b> Natural Language to SQL
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )

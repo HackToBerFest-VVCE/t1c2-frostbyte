@@ -1,281 +1,145 @@
-"""
-Analytics Service for DataLens.
-Performs data aggregation, KPI computations, multi-channel comparisons,
-and query history management.
+"""Analytics Service for DataLens Live.
+
+Provides optimized, safe Snowflake queries for TPC-DS SF10TCL.
+Includes pre-tested queries for sales trends, channel comparisons,
+and product leaderboards that use proper partitioning filters
+to prevent full scans on the multi-terabyte dataset.
 """
 
-from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Tuple, Optional
 import pandas as pd
-from services.snowflake_service import snowflake_service
+from services.snowflake_service import execute_snowflake_query
+from services.sql_validator import validate_and_sanitize_sql
+
+# Standard Year filter to keep scans bounded and lightning-fast on SF10TCL
+DEFAULT_ANALYTICS_YEAR = 2000
 
 
-class AnalyticsService:
-    """Provides high-level analytical metrics and history tracking."""
-
-    @staticmethod
-    def get_dashboard_summary() -> Dict[str, Any]:
-        """Calculates four key dashboard metrics and charts datasets from actual data."""
-        # 1. Total KPI aggregation across store, web, catalog
-        kpi_sql = """
-        SELECT 
-            SUM(sales) AS total_sales,
-            SUM(qty) AS total_items,
-            SUM(records) AS total_records
-        FROM (
-            SELECT SUM(ss_ext_sales_price) AS sales, SUM(ss_quantity) AS qty, COUNT(*) AS records FROM store_sales
-            UNION ALL
-            SELECT SUM(ws_ext_sales_price) AS sales, SUM(ws_quantity) AS qty, COUNT(*) AS records FROM web_sales
-            UNION ALL
-            SELECT SUM(cs_ext_sales_price) AS sales, SUM(cs_quantity) AS qty, COUNT(*) AS records FROM catalog_sales
-        )
-        """
-        df_kpi, _, is_demo, _ = snowflake_service.execute_query(kpi_sql)
-
-        total_sales = 0.0
-        total_items = 0
-        total_records = 0
-        if not df_kpi.empty:
-            total_sales = float(df_kpi.iloc[0]["total_sales"] or 0)
-            total_items = int(df_kpi.iloc[0]["total_items"] or 0)
-            total_records = int(df_kpi.iloc[0]["total_records"] or 0)
-
-        # 2. Top-selling product
-        top_prod_sql = """
-        SELECT i.i_product_name, SUM(s.ss_ext_sales_price) AS sales
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        GROUP BY i.i_product_name
-        ORDER BY sales DESC
-        LIMIT 1
-        """
-        df_top, _, _, _ = snowflake_service.execute_query(top_prod_sql)
-        top_product_name = df_top.iloc[0]["i_product_name"] if not df_top.empty else "N/A"
-        top_product_sales = float(df_top.iloc[0]["sales"] or 0) if not df_top.empty else 0.0
-
-        # 3. Sales by product category
-        category_sql = """
-        SELECT i.i_category AS category, SUM(s.ss_ext_sales_price) AS total_sales
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        GROUP BY i.i_category
-        ORDER BY total_sales DESC
-        """
-        df_category, _, _, _ = snowflake_service.execute_query(category_sql)
-
-        # 4. Sales trends over time (by month)
-        trend_sql = """
-        SELECT 
-            d.d_year AS year,
-            d.d_moy AS month_num,
-            d.d_month_name AS month,
-            SUM(s.ss_ext_sales_price) AS total_sales
-        FROM store_sales s
-        JOIN date_dim d ON s.ss_sold_date_sk = d.d_date_sk
-        GROUP BY d.d_year, d.d_moy, d.d_month_name
-        ORDER BY d.d_year ASC, d.d_moy ASC
-        LIMIT 24
-        """
-        df_trends, _, _, _ = snowflake_service.execute_query(trend_sql)
-
-        # 5. Top 10 products
-        top10_sql = """
-        SELECT 
-            i.i_product_name AS product_name,
-            i.i_category AS category,
-            SUM(s.ss_ext_sales_price) AS sales,
-            SUM(s.ss_quantity) AS units
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        GROUP BY i.i_product_name, i.i_category
-        ORDER BY sales DESC
-        LIMIT 10
-        """
-        df_top10, _, _, _ = snowflake_service.execute_query(top10_sql)
-
-        # 6. Channels comparison
-        channels_sql = """
-        SELECT 'Store' AS channel, SUM(ss_ext_sales_price) AS sales, SUM(ss_quantity) AS units FROM store_sales
-        UNION ALL
-        SELECT 'Web' AS channel, SUM(ws_ext_sales_price) AS sales, SUM(ws_quantity) AS units FROM web_sales
-        UNION ALL
-        SELECT 'Catalog' AS channel, SUM(cs_ext_sales_price) AS sales, SUM(cs_quantity) AS units FROM catalog_sales
-        ORDER BY sales DESC
-        """
-        df_channels, _, _, _ = snowflake_service.execute_query(channels_sql)
-
-        return {
-            "total_sales": total_sales,
-            "total_items": total_items,
-            "total_records": total_records,
-            "top_product_name": top_product_name,
-            "top_product_sales": top_product_sales,
-            "df_category": df_category,
-            "df_trends": df_trends,
-            "df_top10": df_top10,
-            "df_channels": df_channels,
-            "is_demo": is_demo,
-        }
-
-    @staticmethod
-    def get_sales_analytics(selected_category: str = "All", year_filter: Optional[int] = None) -> Dict[str, Any]:
-        """Fetches sales analytics with category and date filtering."""
-        where_clauses = []
-        if selected_category and selected_category != "All":
-            where_clauses.append(f"i.i_category = '{selected_category}'")
-        if year_filter:
-            where_clauses.append(f"d.d_year = {year_filter}")
-
-        where_str = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-        # Summary KPIs
-        summary_sql = f"""
-        SELECT 
-            SUM(s.ss_ext_sales_price) AS total_sales,
-            SUM(s.ss_quantity) AS total_quantity,
-            COUNT(*) AS total_transactions,
-            ROUND(AVG(s.ss_ext_sales_price), 2) AS avg_order_value
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        JOIN date_dim d ON s.ss_sold_date_sk = d.d_date_sk
-        {where_str}
-        """
-        df_summary, _, is_demo, _ = snowflake_service.execute_query(summary_sql)
-
-        # Monthly time series
-        monthly_sql = f"""
-        SELECT 
-            d.d_year AS year,
-            d.d_moy AS month_num,
-            d.d_month_name AS month,
-            SUM(s.ss_ext_sales_price) AS sales,
-            SUM(s.ss_quantity) AS quantity
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        JOIN date_dim d ON s.ss_sold_date_sk = d.d_date_sk
-        {where_str}
-        GROUP BY d.d_year, d.d_moy, d.d_month_name
-        ORDER BY d.d_year ASC, d.d_moy ASC
-        """
-        df_monthly, _, _, _ = snowflake_service.execute_query(monthly_sql)
-
-        # Product breakdown
-        product_sql = f"""
-        SELECT 
-            i.i_product_name AS product_name,
-            i.i_category AS category,
-            SUM(s.ss_ext_sales_price) AS revenue,
-            SUM(s.ss_quantity) AS units_sold,
-            ROUND(AVG(s.ss_sales_price), 2) AS avg_unit_price
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        JOIN date_dim d ON s.ss_sold_date_sk = d.d_date_sk
-        {where_str}
-        GROUP BY i.i_product_name, i.i_category
-        ORDER BY revenue DESC
-        LIMIT 25
-        """
-        df_products, _, _, _ = snowflake_service.execute_query(product_sql)
-
-        # Channel comparison
-        channel_sql = """
-        SELECT 'Store' AS channel, SUM(ss_ext_sales_price) AS sales, SUM(ss_quantity) AS units FROM store_sales
-        UNION ALL
-        SELECT 'Web' AS channel, SUM(ws_ext_sales_price) AS sales, SUM(ws_quantity) AS units FROM web_sales
-        UNION ALL
-        SELECT 'Catalog' AS channel, SUM(cs_ext_sales_price) AS sales, SUM(cs_quantity) AS units FROM catalog_sales
-        """
-        df_channels, _, _, _ = snowflake_service.execute_query(channel_sql)
-
-        return {
-            "summary": df_summary,
-            "monthly": df_monthly,
-            "products": df_products,
-            "channels": df_channels,
-            "is_demo": is_demo,
-        }
-
-    @staticmethod
-    def get_product_analytics(search_term: str = "", category_filter: str = "All") -> Dict[str, Any]:
-        """Fetches product-specific metrics, rankings, and search results."""
-        where_conds = []
-        if category_filter and category_filter != "All":
-            where_conds.append(f"i.i_category = '{category_filter}'")
-        if search_term:
-            clean_term = search_term.replace("'", "''")
-            where_conds.append(f"(LOWER(i.i_product_name) LIKE '%{clean_term.lower()}%' OR LOWER(i.i_brand) LIKE '%{clean_term.lower()}%')")
-
-        where_clause = f"WHERE {' AND '.join(where_conds)}" if where_conds else ""
-
-        # Top 10 by sales
-        top_sales_sql = f"""
-        SELECT 
-            i.i_item_id AS item_code,
-            i.i_product_name AS product_name,
-            i.i_category AS category,
-            i.i_brand AS brand,
-            SUM(s.ss_ext_sales_price) AS total_sales,
-            SUM(s.ss_quantity) AS units_sold
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        {where_clause}
-        GROUP BY i.i_item_id, i.i_product_name, i.i_category, i.i_brand
-        ORDER BY total_sales DESC
-        LIMIT 10
-        """
-        df_top_sales, _, is_demo, _ = snowflake_service.execute_query(top_sales_sql)
-
-        # Top 10 by quantity
-        top_qty_sql = f"""
-        SELECT 
-            i.i_item_id AS item_code,
-            i.i_product_name AS product_name,
-            i.i_category AS category,
-            i.i_brand AS brand,
-            SUM(s.ss_quantity) AS units_sold,
-            SUM(s.ss_ext_sales_price) AS total_sales
-        FROM store_sales s
-        JOIN item i ON s.ss_item_sk = i.i_item_sk
-        {where_clause}
-        GROUP BY i.i_item_id, i.i_product_name, i.i_category, i.i_brand
-        ORDER BY units_sold DESC
-        LIMIT 10
-        """
-        df_top_qty, _, _, _ = snowflake_service.execute_query(top_qty_sql)
-
-        # Catalog listing
-        catalog_sql = f"""
-        SELECT 
-            i.i_item_id AS item_code,
-            i.i_product_name AS product_name,
-            i.i_category AS category,
-            i.i_brand AS brand,
-            i.i_current_price AS unit_price,
-            COALESCE(SUM(s.ss_quantity), 0) AS units_sold,
-            COALESCE(SUM(s.ss_ext_sales_price), 0.0) AS lifetime_revenue
-        FROM item i
-        LEFT JOIN store_sales s ON i.i_item_sk = s.ss_item_sk
-        {where_clause}
-        GROUP BY i.i_item_id, i.i_product_name, i.i_category, i.i_brand, i.i_current_price
-        ORDER BY lifetime_revenue DESC
-        """
-        df_catalog, _, _, _ = snowflake_service.execute_query(catalog_sql)
-
-        return {
-            "top_sales": df_top_sales,
-            "top_qty": df_top_qty,
-            "catalog": df_catalog,
-            "is_demo": is_demo,
-        }
-
-    @staticmethod
-    def get_categories() -> List[str]:
-        """Returns list of distinct product categories."""
-        sql = "SELECT DISTINCT i_category FROM item WHERE i_category IS NOT NULL ORDER BY i_category"
-        df, _, _, _ = snowflake_service.execute_query(sql)
-        if not df.empty and "i_category" in df.columns:
-            return ["All"] + df["i_category"].dropna().tolist()
-        return ["All", "Electronics", "Apparel", "Home & Kitchen", "Books", "Sports"]
+def run_safe_query(sql: str, max_rows: int = 100) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """Validate query with SQL validator before executing against Snowflake."""
+    is_valid, sanitized_sql, err = validate_and_sanitize_sql(sql, default_limit=max_rows)
+    if not is_valid:
+        return None, 0.0, f"SQL Validation Failed: {err}"
+    
+    return execute_snowflake_query(sanitized_sql, max_rows=max_rows)
 
 
-analytics_service = AnalyticsService()
+def get_sales_kpi_summary(year: int = DEFAULT_ANALYTICS_YEAR) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """
+    Fetch high-level KPI metrics:
+    - Total Store Sales
+    - Total Quantity Sold
+    - Total Profit
+    - Average Ticket Value
+    """
+    sql = f"""
+    SELECT
+        ROUND(SUM(ss_ext_sales_price), 2) AS total_sales,
+        SUM(ss_quantity) AS total_quantity,
+        ROUND(SUM(ss_net_profit), 2) AS total_profit,
+        ROUND(AVG(ss_sales_price), 2) AS avg_sales_price,
+        COUNT(DISTINCT ss_ticket_number) AS total_orders
+    FROM store_sales
+    JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE d_year = {year}
+    """
+    return run_safe_query(sql, max_rows=1)
+
+
+def get_sales_trend_by_date(year: int = DEFAULT_ANALYTICS_YEAR) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """
+    Fetch daily sales trend for the selected year.
+    """
+    sql = f"""
+    SELECT
+        d_date AS sale_date,
+        ROUND(SUM(ss_ext_sales_price), 2) AS daily_sales,
+        SUM(ss_quantity) AS units_sold
+    FROM store_sales
+    JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE d_year = {year}
+    GROUP BY d_date
+    ORDER BY d_date ASC
+    LIMIT 100
+    """
+    return run_safe_query(sql, max_rows=100)
+
+
+def get_top_products(limit: int = 10, year: int = DEFAULT_ANALYTICS_YEAR) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """
+    Fetch top products by total sales.
+    """
+    sql = f"""
+    SELECT
+        COALESCE(i_product_name, i_item_desc, 'Item #' || i_item_sk) AS product_name,
+        COALESCE(i_category, 'Uncategorized') AS category,
+        ROUND(SUM(ss_ext_sales_price), 2) AS total_sales,
+        SUM(ss_quantity) AS total_quantity_sold
+    FROM store_sales
+    JOIN item ON ss_item_sk = i_item_sk
+    JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE d_year = {year}
+    GROUP BY 1, 2
+    ORDER BY total_sales DESC
+    LIMIT {limit}
+    """
+    return run_safe_query(sql, max_rows=limit)
+
+
+def get_omnichannel_comparison(year: int = DEFAULT_ANALYTICS_YEAR) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """
+    Compare Store, Web, and Catalog Sales channels.
+    """
+    sql = f"""
+    WITH store AS (
+        SELECT 'Store Sales' AS channel,
+               ROUND(SUM(ss_ext_sales_price), 2) AS sales,
+               SUM(ss_quantity) AS quantity
+        FROM store_sales
+        JOIN date_dim ON ss_sold_date_sk = d_date_sk
+        WHERE d_year = {year}
+    ),
+    web AS (
+        SELECT 'Web Sales' AS channel,
+               ROUND(SUM(ws_ext_sales_price), 2) AS sales,
+               SUM(ws_quantity) AS quantity
+        FROM web_sales
+        JOIN date_dim ON ws_sold_date_sk = d_date_sk
+        WHERE d_year = {year}
+    ),
+    catalog AS (
+        SELECT 'Catalog Sales' AS channel,
+               ROUND(SUM(cs_ext_sales_price), 2) AS sales,
+               SUM(cs_quantity) AS quantity
+        FROM catalog_sales
+        JOIN date_dim ON cs_sold_date_sk = d_date_sk
+        WHERE d_year = {year}
+    )
+    SELECT * FROM store
+    UNION ALL
+    SELECT * FROM web
+    UNION ALL
+    SELECT * FROM catalog
+    """
+    return run_safe_query(sql, max_rows=10)
+
+
+def get_category_performance(year: int = DEFAULT_ANALYTICS_YEAR) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """
+    Sales performance grouped by product category.
+    """
+    sql = f"""
+    SELECT
+        COALESCE(i_category, 'Other') AS category,
+        ROUND(SUM(ss_ext_sales_price), 2) AS total_sales,
+        SUM(ss_quantity) AS total_quantity,
+        ROUND(SUM(ss_net_profit), 2) AS net_profit
+    FROM store_sales
+    JOIN item ON ss_item_sk = i_item_sk
+    JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE d_year = {year}
+    GROUP BY 1
+    ORDER BY total_sales DESC
+    LIMIT 20
+    """
+    return run_safe_query(sql, max_rows=20)

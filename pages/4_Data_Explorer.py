@@ -1,160 +1,156 @@
-"""
-Data Explorer Page for DataLens.
-Allows safe inspection of Snowflake database schema, retail tables, column definitions,
-and limited row previews without running unrestricted queries.
+"""Data Explorer Page — Live Schema Inspection & Safe SQL Execution Console.
 """
 
 import streamlit as st
 import pandas as pd
-from utils.config import get_custom_css, COLORS, APP_NAME, APPROVED_TABLES
-from components.sidebar import render_sidebar
-from components.metric_cards import render_demo_banner
-from services.snowflake_service import snowflake_service
 
-# Page Setup
+from services.ui_theme import (
+    apply_theme,
+    render_hero_banner,
+    COLOR_PRIMARY_BLUE,
+    COLOR_PURPLE,
+    COLOR_CARD,
+    COLOR_BORDER,
+    COLOR_DARK_NAVY,
+)
+from services.snowflake_service import (
+    test_connection,
+    get_snowflake_config,
+    execute_snowflake_query,
+    inspect_schema,
+    DEFAULT_DATABASE,
+    DEFAULT_SCHEMA,
+)
+from services.sql_validator import validate_and_sanitize_sql, ALLOWED_TABLES
+
 st.set_page_config(
-    page_title=f"Data Explorer — {APP_NAME}",
-    page_icon="🔍",
+    page_title="Data Explorer — DataLens Live",
+    page_icon="🔎",
     layout="wide",
 )
-st.markdown(get_custom_css(), unsafe_allow_html=True)
-render_sidebar(active_page="Data Explorer")
+apply_theme()
 
-# Header
-st.markdown(
-    f"""
-    <div>
-        <h1 style="font-size: 2rem; font-weight: 800; color: {COLORS['text']}; margin: 0;">
-            🔍 Snowflake Retail Data Explorer
-        </h1>
-        <p style="font-size: 0.95rem; color: #64748B; margin-top: 4px; margin-bottom: 20px;">
-            Inspect tables, explore column metadata, understand data types, and preview sample rows safely.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+cfg = get_snowflake_config()
+is_connected = False
+if cfg:
+    is_connected, _, _ = test_connection()
+
+active_db = cfg.get("database", DEFAULT_DATABASE) if cfg else DEFAULT_DATABASE
+active_sch = cfg.get("schema", DEFAULT_SCHEMA) if cfg else DEFAULT_SCHEMA
+
+render_hero_banner(
+    title="Snowflake Data Explorer",
+    subtitle="Inspect live schema structure, browse table metadata, and execute validated ad-hoc queries",
+    data_source=f"{active_db}.{active_sch}",
+    connected=is_connected
 )
 
-status = snowflake_service.get_connection_status()
-render_demo_banner(status["is_demo"])
+if not is_connected:
+    st.warning("⚠️ **Live Snowflake Connection Required**")
+    st.info("Configure your credentials in `.streamlit/secrets.toml` to inspect live tables and schemas.")
+    st.stop()
 
-# Schema Context Card
-col_meta1, col_meta2, col_meta3 = st.columns(3)
-with col_meta1:
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top-color: {COLORS['primary']};">
-            <div class="kpi-label">Active Database</div>
-            <div class="kpi-value" style="font-size: 1.25rem;">{status['database']}</div>
-            <div class="kpi-subtext">Snowflake Retail Warehouse</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with col_meta2:
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top-color: {COLORS['highlight']};">
-            <div class="kpi-label">Active Schema</div>
-            <div class="kpi-value" style="font-size: 1.25rem;">{status['schema']}</div>
-            <div class="kpi-subtext">TPC-DS Benchmark Model</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with col_meta3:
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="border-top-color: #0284C7;">
-            <div class="kpi-label">Whitelisted Tables</div>
-            <div class="kpi-value" style="font-size: 1.25rem;">{len(APPROVED_TABLES)} Approved</div>
-            <div class="kpi-subtext">Protected by SQLValidator</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
-
-# Table Selector & Inspection
-col_sel, col_lim = st.columns([3, 1])
-with col_sel:
-    selected_table = st.selectbox(
-        "Select Table to Inspect:",
-        options=APPROVED_TABLES,
-        index=0,
-        help="Select any approved retail table to view column schema and row previews.",
-    )
-with col_lim:
-    preview_limit = st.selectbox("Preview Limit:", options=[10, 25, 50], index=0)
-
-# Schema Definition & Data Preview Tabs
-tab_schema, tab_preview, tab_erd = st.tabs(["📋 Columns & Data Types", "👁️ Safe Row Preview", "📐 Schema Relationship Graph"])
+tab_schema, tab_console = st.tabs(["📋 Schema & Table Inspector", "💻 Safe SQL Console"])
 
 with tab_schema:
-    st.markdown(f"#### Column Definitions for `{selected_table}`")
-    df_schema = snowflake_service.get_table_schema(selected_table)
-    if not df_schema.empty:
-        st.dataframe(df_schema, use_container_width=True)
-    else:
-        st.info("Schema details could not be retrieved.")
-
-with tab_preview:
-    st.markdown(f"#### Sample Data for `{selected_table}` (Limited to top {preview_limit} rows)")
-    with st.spinner(f"Fetching {preview_limit} rows from {selected_table}..."):
-        df_prev, is_demo_prev, err_prev = snowflake_service.preview_table(selected_table, limit=preview_limit)
-        
-        if err_prev and df_prev.empty:
-            st.error(f"Error fetching preview: {err_prev}")
-        elif df_prev.empty:
-            st.warning("Table returned zero preview rows.")
-        else:
-            st.dataframe(df_prev, use_container_width=True)
-            st.caption(f"🛡️ Guardrail active: row limit enforced to {preview_limit} to protect warehouse compute resources.")
-
-with tab_erd:
-    st.markdown("#### Entity Relationship Overview (Snowflake TPC-DS Retail Model)")
+    st.markdown("### 🗄️ Database Schema Inspector")
     st.markdown(
-        """
-```mermaid
-erDiagram
-    STORE_SALES ||--o{ ITEM : "ss_item_sk = i_item_sk"
-    STORE_SALES ||--o{ DATE_DIM : "ss_sold_date_sk = d_date_sk"
-    STORE_SALES ||--o{ CUSTOMER : "ss_customer_sk = c_customer_sk"
-    WEB_SALES ||--o{ ITEM : "ws_item_sk = i_item_sk"
-    WEB_SALES ||--o{ DATE_DIM : "ws_sold_date_sk = d_date_sk"
-    CATALOG_SALES ||--o{ ITEM : "cs_item_sk = i_item_sk"
-    CATALOG_SALES ||--o{ DATE_DIM : "cs_sold_date_sk = d_date_sk"
-
-    STORE_SALES {
-        int ss_sold_date_sk FK
-        int ss_item_sk FK
-        int ss_customer_sk FK
-        int ss_quantity
-        decimal ss_sales_price
-        decimal ss_ext_sales_price
-    }
-    ITEM {
-        int i_item_sk PK
-        string i_item_id
-        string i_product_name
-        string i_category
-        string i_brand
-        decimal i_current_price
-    }
-    DATE_DIM {
-        int d_date_sk PK
-        date d_date
-        int d_year
-        int d_moy
-        string d_month_name
-    }
-    CUSTOMER {
-        int c_customer_sk PK
-        string c_customer_id
-        string c_first_name
-        string c_last_name
-    }
-```
-        """
+        f"Inspecting active schema: **`{active_db}.{active_sch}`**. "
+        "Dynamic discovery verifies actual available tables without assumptions."
     )
+
+    with st.spinner("Inspecting Snowflake INFORMATION_SCHEMA..."):
+        schema_map = inspect_schema(active_db, active_sch)
+
+    if not schema_map:
+        st.info(
+            f"No accessible tables discovered in `{active_db}.{active_sch}`. "
+            "Please check warehouse privileges or select another schema."
+        )
+    else:
+        tables_list = sorted(list(schema_map.keys()))
+        selected_tbl = st.selectbox("Select Table to Inspect:", options=tables_list)
+
+        if selected_tbl:
+            cols = schema_map.get(selected_tbl, [])
+            st.markdown(f"**Table:** `{selected_tbl}` ({len(cols)} columns detected)")
+            
+            c_left, c_right = st.columns([1, 2])
+            with c_left:
+                st.markdown("##### 📑 Column List")
+                if cols:
+                    st.dataframe(pd.DataFrame({"Column Name": cols}), use_container_width=True, height=350)
+                else:
+                    st.caption("Column metadata unavailable.")
+
+            with c_right:
+                st.markdown("##### 👁️ Live Data Sample (First 10 Rows)")
+                preview_sql = f"SELECT * FROM {selected_tbl} LIMIT 10"
+                with st.spinner("Fetching sample rows..."):
+                    df_sample, sample_time, sample_err = execute_snowflake_query(preview_sql, max_rows=10)
+                
+                if sample_err:
+                    st.error(f"Sample query failed: {sample_err}")
+                elif df_sample is not None and not df_sample.empty:
+                    st.dataframe(df_sample, use_container_width=True, height=350)
+                    st.caption(f"⚡ Fetched in {sample_time}s")
+                else:
+                    st.info("Table is empty or returned 0 rows.")
+
+with tab_console:
+    st.markdown("### 💻 Safe Snowflake SQL Console")
+    st.markdown(
+        "Execute custom read-only SQL queries with built-in safety guards. "
+        "Queries are strictly validated against data-altering statements and restricted to allowlisted tables."
+    )
+
+    st.markdown(f"**Permitted Tables:** `{', '.join(sorted(ALLOWED_TABLES))}`")
+
+    default_query = """SELECT 
+    d_year,
+    COUNT(ss_ticket_number) AS total_orders,
+    ROUND(SUM(ss_ext_sales_price), 2) AS total_sales
+FROM store_sales
+JOIN date_dim ON ss_sold_date_sk = d_date_sk
+WHERE d_year IN (1999, 2000)
+GROUP BY d_year
+ORDER BY d_year ASC
+LIMIT 10;"""
+
+    custom_sql = st.text_area(
+        "Enter SQL Query (Read-Only SELECT):",
+        value=default_query,
+        height=180,
+    )
+
+    if st.button("▶️ Execute Safe Query", type="primary"):
+        if not custom_sql.strip():
+            st.warning("Please enter a SQL query.")
+        else:
+            with st.status("Validating SQL query safety...", expanded=True) as status:
+                is_valid, sanitized_sql, err = validate_and_sanitize_sql(custom_sql, default_limit=100)
+                if not is_valid:
+                    status.update(label="❌ Query Blocked by Safety Policy", state="error")
+                    st.error(f"**Safety Rule Violation:** {err}")
+                    st.stop()
+                status.update(label="✅ Query Validated & Sanitized", state="complete")
+
+            st.code(sanitized_sql, language="sql")
+
+            with st.spinner("Executing query on Snowflake..."):
+                res_df, q_time, q_err = execute_snowflake_query(sanitized_sql, max_rows=100)
+            
+            if q_err:
+                st.error(f"Execution Error: {q_err}")
+            elif res_df is not None:
+                st.success(f"Query completed in {q_time} seconds! Retrieved {len(res_df)} rows.")
+                st.dataframe(res_df, use_container_width=True)
+                
+                # Download button
+                csv = res_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📥 Download Results as CSV",
+                    data=csv,
+                    file_name="snowflake_query_results.csv",
+                    mime="text/csv",
+                )

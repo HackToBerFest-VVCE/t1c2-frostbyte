@@ -1,170 +1,167 @@
-"""
-SQL Validation and Security Layer for DataLens.
+"""SQL Validator and Sanitizer Module for DataLens Live.
 
-Treats all model-generated and user-submitted SQL as untrusted.
-Enforces:
-- Read-only SELECT statements only.
-- Strict rejection of destructive or administrative DDL/DML operations (INSERT, UPDATE, DELETE, DROP, etc.).
-- Multi-statement execution blocking (prevents semicolon chaining).
-- Whitelist of approved retail schema tables.
-- Automatic enforcement of reasonable row limits (e.g., LIMIT 100).
-- Safe error explanations without credential or system information leaks.
+Ensures strict SQL safety:
+- Only read-only SELECT (or WITH ... SELECT) queries are allowed.
+- Multiple statements are rejected.
+- Data manipulation/definition statements (INSERT, UPDATE, DELETE, DROP, etc.) are strictly blocked.
+- Only allowlisted Snowflake tables are permitted (STORE_SALES, WEB_SALES, CATALOG_SALES, ITEM, CUSTOMER, DATE_DIM).
+- Enforces an automatic LIMIT clause (default 100 rows).
 """
 
 import re
 from typing import Tuple, List, Set
-from utils.config import APPROVED_TABLES
+import sqlparse
+from sqlparse.sql import IdentifierList, Identifier, Function
+from sqlparse.tokens import Keyword, DML
 
-# Explicitly prohibited SQL keywords and commands
-PROHIBITED_KEYWORDS: Set[str] = {
-    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
-    "MERGE", "EXEC", "EXECUTE", "CALL", "GRANT", "REVOKE", "RENAME",
-    "REPLACE", "UPSERT", "SYSTEM$", "PUT", "GET", "COPY", "REMOVE",
-    "UNDROP", "SHOW", "DESCRIBE", "USE", "SET", "UNSET", "BEGIN", "COMMIT", "ROLLBACK"
+# Approved base tables in Snowflake TPCDS_SF10TCL
+ALLOWED_TABLES = {
+    "STORE_SALES",
+    "WEB_SALES",
+    "CATALOG_SALES",
+    "ITEM",
+    "CUSTOMER",
+    "DATE_DIM",
 }
 
-# Approved retail tables (including lowercase and demo aliases)
-ALL_APPROVED_TABLES: Set[str] = set(APPROVED_TABLES) | {
-    t.lower() for t in APPROVED_TABLES
-} | {
-    "DEMO_RETAIL_DATA", "demo_retail_data",
-    "store_sales", "web_sales", "catalog_sales", "item", "customer", "date_dim"
-}
-
-# Regex to strip single and multi-line comments
-COMMENT_STRIP_REGEX = re.compile(r"(--[^\r\n]*)|(/\*[\s\S]*?\*/)", re.MULTILINE)
+# Forbidden keywords / commands that modify data or execute system actions
+FORBIDDEN_KEYWORDS = [
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE",
+    "REPLACE", "MERGE", "GRANT", "REVOKE", "COPY", "EXECUTE", "EXEC",
+    "CALL", "PUT", "GET", "REMOVE", "SYSTEM$", "UNLOAD", "INTO OUTFILE",
+    "INTO DUMPFILE", "INFORMATION_SCHEMA", "ACCOUNT_USAGE"
+]
 
 
-class SQLValidationError(Exception):
-    """Raised when generated SQL fails security checks."""
-    pass
+def clean_sql_text(raw_sql: str) -> str:
+    """Strip markdown code blocks, comments, and extraneous whitespace."""
+    if not raw_sql:
+        return ""
+    
+    # Remove markdown code fences if present (e.g. ```sql ... ```)
+    cleaned = re.sub(r"^```(?:sql)?\s*", "", raw_sql.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+    
+    # Remove trailing semicolons for consistent processing
+    cleaned = cleaned.strip().rstrip(";")
+    return cleaned.strip()
 
 
-class SQLValidator:
-    """Security validator for SQL queries before database execution."""
+def extract_cte_aliases(sql: str) -> Set[str]:
+    """Extract CTE names defined in WITH cte_name AS (...) blocks."""
+    cte_pattern = r"(?:with|,)\s*([a-zA-Z0-9_]+)\s+as\s*\("
+    matches = re.findall(cte_pattern, sql, flags=re.IGNORECASE)
+    return {m.upper() for m in matches}
 
-    @staticmethod
-    def clean_query(sql: str) -> str:
-        """Removes trailing semicolons, leading/trailing whitespace, and markdown blocks."""
-        if not sql:
-            return ""
+
+def extract_table_references(sql: str) -> List[str]:
+    """Extract referenced table names from FROM and JOIN clauses."""
+    tables = []
+    # Match patterns like: FROM table_name, JOIN table_name, FROM db.schema.table
+    patterns = [
+        r"\bFROM\s+([a-zA-Z0-9_\.\"]+)",
+        r"\bJOIN\s+([a-zA-Z0-9_\.\"]+)",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, sql, flags=re.IGNORECASE):
+            raw_target = match.group(1).strip().replace('"', '')
+            # If qualified (e.g. SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.STORE_SALES), take the table part
+            table_name = raw_target.split(".")[-1].upper()
+            if table_name and table_name not in ("SELECT", "LATERAL", "FLATTEN"):
+                tables.append(table_name)
+    return tables
+
+
+def validate_and_sanitize_sql(
+    raw_sql: str,
+    default_limit: int = 100,
+    allow_custom_limit: bool = True
+) -> Tuple[bool, str, str]:
+    """
+    Validate a user or LLM-generated SQL query for safety.
+
+    Returns:
+        (is_valid: bool, sanitized_sql: str, error_message: str)
+    """
+    if not raw_sql or not raw_sql.strip():
+        return False, "", "SQL query cannot be empty."
+
+    sql = clean_sql_text(raw_sql)
+
+    # 1. Reject multiple statements (check for semicolons inside query text)
+    statements = sqlparse.split(sql)
+    if len(statements) > 1:
+        return False, "", "Multiple SQL statements are not permitted for security reasons."
+
+    parsed = sqlparse.parse(sql)
+    if not parsed:
+        return False, "", "Unable to parse SQL query."
+
+    statement = parsed[0]
+
+    # 2. Check statement type: Must be a SELECT or WITH statement
+    stmt_type = statement.get_type().upper()
+    first_token = ""
+    for token in statement.tokens:
+        if not token.is_whitespace:
+            first_token = token.value.upper()
+            break
+
+    if stmt_type != "SELECT" and first_token not in ("SELECT", "WITH"):
+        return False, "", f"Only read-only SELECT queries are allowed. Found statement type: '{stmt_type or first_token}'."
+
+    # 3. Check for strictly forbidden keywords anywhere in tokens
+    upper_sql = sql.upper()
+    for forbidden in FORBIDDEN_KEYWORDS:
+        # Check as full word boundary
+        if re.search(r"\b" + re.escape(forbidden) + r"\b", upper_sql):
+            return False, "", f"Disallowed keyword detected: '{forbidden}'. Only read-only operations are permitted."
+
+    # 4. Check for comments that could be used for SQL injection obfuscation
+    if "--" in sql or "/*" in sql:
+        # Strip comments using sqlparse
+        sql = sqlparse.format(sql, strip_comments=True).strip()
+
+    # 5. Extract tables and ensure they match the allowlist (or CTE aliases)
+    cte_aliases = extract_cte_aliases(sql)
+    table_refs = extract_table_references(sql)
+
+    if not table_refs:
+        # If no tables found (e.g. SELECT 1 or SELECT CURRENT_TIMESTAMP()), allow it
+        pass
+    else:
+        disallowed = []
+        for tbl in table_refs:
+            if tbl not in ALLOWED_TABLES and tbl not in cte_aliases:
+                disallowed.append(tbl)
         
-        # Remove markdown code fences if model returned them
-        sql = sql.strip()
-        if sql.startswith("```"):
-            lines = sql.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            sql = "\n".join(lines).strip()
-
-        # Remove comments to analyze raw statements
-        sql = COMMENT_STRIP_REGEX.sub(" ", sql).strip()
-
-        # Remove trailing semicolons
-        sql = re.sub(r";+\s*$", "", sql).strip()
-        return sql
-
-    @classmethod
-    def validate(cls, raw_sql: str, max_limit: int = 100) -> Tuple[bool, str, str]:
-        """
-        Validates raw SQL for read-only safety, single-statement structure, and approved tables.
-
-        Returns:
-            Tuple[bool, str, str]: (is_valid, error_message, sanitized_sql)
-        """
-        cleaned = cls.clean_query(raw_sql)
-
-        if not cleaned:
-            return False, "Query cannot be empty.", ""
-
-        # 1. Multi-statement check (semicolons remaining inside query)
-        # Note: allow semicolons only if inside string literals, but for analytics queries, no internal semicolons needed
-        if ";" in cleaned:
+        if disallowed:
             return (
                 False,
-                "Security policy rejection: Multi-statement execution or query chaining (;) is strictly forbidden.",
                 "",
+                f"Access to table(s) {', '.join(set(disallowed))} is not permitted. "
+                f"Allowed tables: {', '.join(sorted(ALLOWED_TABLES))}."
             )
 
-        # 2. Check first command token - must be SELECT or WITH (CTE)
-        tokens = cleaned.split()
-        if not tokens:
-            return False, "Query is empty after tokenization.", ""
+    # 6. Enforce LIMIT 100 if not present
+    has_limit = re.search(r"\bLIMIT\s+(\d+)", sql, flags=re.IGNORECASE)
+    if not has_limit:
+        # Also check for FETCH FIRST
+        has_fetch = re.search(r"\bFETCH\s+FIRST\s+(\d+)\s+ROWS\s+ONLY", sql, flags=re.IGNORECASE)
+        if not has_fetch:
+            sql = f"{sql}\nLIMIT {default_limit}"
+    else:
+        # If limit is present and greater than 500, clamp it for safety
+        limit_val = int(has_limit.group(1))
+        if limit_val > 500:
+            sql = re.sub(r"\bLIMIT\s+\d+", f"LIMIT {default_limit}", sql, flags=re.IGNORECASE)
 
-        first_token = tokens[0].upper()
-        if first_token not in ("SELECT", "WITH"):
-            return (
-                False,
-                f"Security policy rejection: Only read-only queries beginning with SELECT or WITH are permitted. Attempted: '{first_token}'.",
-                "",
-            )
+    # Format cleanly with sqlparse
+    formatted_sql = sqlparse.format(
+        sql,
+        reindent=True,
+        keyword_case="upper",
+        identifier_case="lower"
+    )
 
-        # 3. Scan for any prohibited command keywords
-        # Tokenize by word boundaries
-        words = re.findall(r"\b[A-Za-z_][A-Za-z0-9_$]*\b", cleaned)
-        upper_words = [w.upper() for w in words]
-
-        for keyword in PROHIBITED_KEYWORDS:
-            if keyword in upper_words:
-                # Disallow dangerous operations
-                return (
-                    False,
-                    f"Security policy rejection: Prohibited operation detected ('{keyword}'). Only read-only SELECT queries are allowed.",
-                    "",
-                )
-
-        # 4. Check that at least one table reference is from the approved retail tables
-        # Look for FROM or JOIN clauses
-        table_references = cls._extract_table_names(cleaned)
-        if table_references:
-            unapproved = [
-                tbl for tbl in table_references 
-                if tbl.upper() not in {t.upper() for t in ALL_APPROVED_TABLES}
-                # Allow CTE definitions
-                and not cls._is_cte(tbl, cleaned)
-            ]
-            if unapproved and len(unapproved) == len(table_references):
-                # If all referenced tables are outside the approved schema
-                return (
-                    False,
-                    f"Security policy rejection: Query references unapproved table(s): {', '.join(unapproved)}. Allowed tables: {', '.join(APPROVED_TABLES)}.",
-                    "",
-                )
-
-        # 5. Enforce reasonable row limits to prevent memory exhaustion
-        sanitized = cls._enforce_limit(cleaned, max_limit)
-
-        return True, "", sanitized
-
-    @classmethod
-    def _is_cte(cls, table_name: str, sql: str) -> bool:
-        """Checks if a table name was defined as a Common Table Expression (WITH alias AS (...))."""
-        cte_pattern = rf"\b{re.escape(table_name)}\s+AS\s*\("
-        return bool(re.search(cte_pattern, sql, re.IGNORECASE))
-
-    @classmethod
-    def _extract_table_names(cls, sql: str) -> List[str]:
-        """Extracts potential table names following FROM or JOIN keywords."""
-        pattern = r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_\.]+)"
-        matches = re.findall(pattern, sql, re.IGNORECASE)
-        table_names = []
-        for m in matches:
-            # Handle schema qualification: e.g. SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.STORE_SALES -> STORE_SALES
-            parts = m.split(".")
-            table_names.append(parts[-1].strip())
-        return table_names
-
-    @classmethod
-    def _enforce_limit(cls, sql: str, default_limit: int = 100) -> str:
-        """Appends or clamps LIMIT clause on the SQL query."""
-        limit_match = re.search(r"\bLIMIT\s+(\d+)\b", sql, re.IGNORECASE)
-        if limit_match:
-            existing_limit = int(limit_match.group(1))
-            if existing_limit > default_limit:
-                # Clamp limit to max allowed
-                return re.sub(r"\bLIMIT\s+\d+\b", f"LIMIT {default_limit}", sql, flags=re.IGNORECASE)
-            return sql
-        else:
-            return f"{sql}\nLIMIT {default_limit}"
+    return True, formatted_sql, ""

@@ -1,355 +1,407 @@
-"""
-Snowflake Integration & Execution Service for DataLens.
+"""Snowflake Database Service for DataLens Live.
 
-Supports:
-- Live Snowflake connectivity using snowflake-connector-python.
-- Safe query execution against SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.
-- Automatic, seamless fallback to local DuckDB demo engine when credentials are absent or connection fails.
-- Never hardcodes credentials or exposes secrets.
+Handles secure authentication, query execution, schema inspection,
+and connection health checks using snowflake-connector-python.
+Credentials are read strictly from .streamlit/secrets.toml.
 """
 
-import os
 import time
-from typing import Dict, Any, Tuple, Optional, List
+import os
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple, List
 import pandas as pd
-import duckdb
-from utils.config import (
-    DEFAULT_DATABASE,
-    DEFAULT_SCHEMA,
-    APPROVED_TABLES,
-    DEMO_WARNING_TEXT,
-)
+import streamlit as st
+import snowflake.connector
+from snowflake.connector.errors import DatabaseError, ProgrammingError, OperationalError
 
+# Try importing tomllib for direct secrets parsing
 try:
-    import streamlit as st
+    import tomllib
 except ImportError:
-    st = None
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
-try:
-    import snowflake.connector
-    SNOWFLAKE_AVAILABLE = True
-except ImportError:
-    SNOWFLAKE_AVAILABLE = False
+# Default target schema details
+DEFAULT_DATABASE = "SNOWFLAKE_SAMPLE_DATA"
+DEFAULT_SCHEMA = "TPCDS_SF10TCL"
+QUERY_TIMEOUT_SECONDS = 45
+SECRETS_PATH = Path(".streamlit/secrets.toml")
+EXAMPLE_SECRETS_PATH = Path(".streamlit/secrets.toml.example")
 
 
-class SnowflakeService:
-    """Manages database connectivity, metadata exploration, and query execution."""
+def clean_account_identifier(raw_account: str) -> str:
+    """Strip protocol, port, slashes, or snowflakecomputing.com domain if present in account string."""
+    if not raw_account:
+        return ""
+    acc = str(raw_account).strip().rstrip("/")
+    if acc.startswith("https://"):
+        acc = acc[len("https://"):]
+    elif acc.startswith("http://"):
+        acc = acc[len("http://"):]
+    if ".snowflakecomputing.com" in acc:
+        acc = acc.split(".snowflakecomputing.com")[0]
+    return acc.strip().rstrip("/")
 
-    def __init__(self):
-        self._demo_conn: Optional[duckdb.DuckDBPyConnection] = None
-        self._init_demo_engine()
 
-    def _init_demo_engine(self):
-        """Initializes in-memory DuckDB populated with the retail demo datasets."""
+def parse_toml_file(path: Path) -> Optional[Dict[str, Any]]:
+    """Read a TOML file from disk safely."""
+    if not path.exists():
+        return None
+    if tomllib is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+            if "snowflake" in data and isinstance(data["snowflake"], dict):
+                return dict(data["snowflake"])
+            elif "account" in data:
+                return dict(data)
+    except Exception:
+        pass
+    return None
+
+
+def get_snowflake_config_diagnostics() -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Inspect the credentials configuration and return diagnostic status.
+    NEVER logs or returns plaintext passwords.
+
+    Returns:
+        (config_or_none, diagnostic_info)
+    """
+    file_exists = SECRETS_PATH.exists()
+    diag: Dict[str, Any] = {
+        "file_exists": file_exists,
+        "file_path": str(SECRETS_PATH.resolve()),
+        "readable": False,
+        "missing_keys": [],
+        "placeholder_keys": [],
+        "configured_keys": [],
+        "error_reason": "",
+        "raw_fields": {},
+        "loaded_from_example": False,
+    }
+
+    sec = None
+
+    # 1. First, check .streamlit/secrets.toml directly from disk
+    if file_exists:
+        raw_sec = parse_toml_file(SECRETS_PATH)
+        if raw_sec:
+            diag["readable"] = True
+            sec = raw_sec
+
+    # 2. If not found or if .streamlit/secrets.toml only has placeholder keys, check .example
+    sec_has_placeholders = (
+        sec is not None and any(str(sec.get(k, "")).startswith("YOUR_") for k in ["account", "user", "password"])
+    )
+
+    if (sec is None or sec_has_placeholders) and EXAMPLE_SECRETS_PATH.exists():
+        example_sec = parse_toml_file(EXAMPLE_SECRETS_PATH)
+        if example_sec and not any(str(example_sec.get(k, "")).startswith("YOUR_") for k in ["account", "user", "password"]):
+            # Real credentials found in .example file!
+            sec = example_sec
+            diag["file_path"] = str(EXAMPLE_SECRETS_PATH.resolve())
+            diag["readable"] = True
+            diag["loaded_from_example"] = True
+
+    # 3. Streamlit secrets fallback if running inside Streamlit
+    if not sec:
         try:
-            self._demo_conn = duckdb.connect(database=":memory:")
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            data_dir = os.path.join(base_dir, "data")
-
-            # Load consolidated table
-            retail_csv = os.path.join(data_dir, "demo_retail_data.csv")
-            if os.path.exists(retail_csv):
-                retail_csv_clean = retail_csv.replace('\\', '/')
-                self._demo_conn.execute(
-                    f"CREATE OR REPLACE TABLE demo_retail_data AS SELECT * FROM read_csv_auto('{retail_csv_clean}')"
-                )
-
-            # Load TPC-DS format tables
-            table_mappings = {
-                "store_sales": "demo_store_sales.csv",
-                "web_sales": "demo_web_sales.csv",
-                "catalog_sales": "demo_catalog_sales.csv",
-                "item": "demo_item.csv",
-                "customer": "demo_customer.csv",
-                "date_dim": "demo_date_dim.csv",
-            }
-            for tbl, fname in table_mappings.items():
-                fpath = os.path.join(data_dir, fname)
-                if os.path.exists(fpath):
-                    fpath_clean = fpath.replace("\\", "/")
-                    self._demo_conn.execute(
-                        f"CREATE OR REPLACE TABLE {tbl} AS SELECT * FROM read_csv_auto('{fpath_clean}')"
-                    )
-        except Exception as e:
-            print(f"Error initializing demo DuckDB engine: {e}")
-
-    def get_credentials(self) -> Dict[str, str]:
-        """Safely extracts Snowflake credentials from Streamlit secrets or environment."""
-        creds = {}
-
-        # 1. Try Streamlit secrets safely
-        try:
-            if st and hasattr(st, "secrets") and "snowflake" in st.secrets:
-                sec = st.secrets["snowflake"]
-                creds["account"] = sec.get("account", "")
-                creds["user"] = sec.get("user", "")
-                creds["password"] = sec.get("password", "")
-                creds["warehouse"] = sec.get("warehouse", "COMPUTE_WH")
-                creds["database"] = sec.get("database", DEFAULT_DATABASE)
-                creds["schema"] = sec.get("schema", DEFAULT_SCHEMA)
-                creds["role"] = sec.get("role", "ACCOUNTADMIN")
+            if "snowflake" in st.secrets:
+                sec = dict(st.secrets["snowflake"])
+                diag["readable"] = True
+            elif hasattr(st, "secrets") and "account" in st.secrets:
+                sec = dict(st.secrets)
+                diag["readable"] = True
         except Exception:
             pass
 
-        # 2. Override with Environment Variables if set
-        creds["account"] = os.getenv("SNOWFLAKE_ACCOUNT", creds.get("account", ""))
-        creds["user"] = os.getenv("SNOWFLAKE_USER", creds.get("user", ""))
-        creds["password"] = os.getenv("SNOWFLAKE_PASSWORD", creds.get("password", ""))
-        creds["warehouse"] = os.getenv("SNOWFLAKE_WAREHOUSE", creds.get("warehouse", "COMPUTE_WH"))
-        creds["database"] = os.getenv("SNOWFLAKE_DATABASE", creds.get("database", DEFAULT_DATABASE))
-        creds["schema"] = os.getenv("SNOWFLAKE_SCHEMA", creds.get("schema", DEFAULT_SCHEMA))
-        creds["role"] = os.getenv("SNOWFLAKE_ROLE", creds.get("role", "ACCOUNTADMIN"))
+    if not file_exists and not diag["loaded_from_example"]:
+        diag["error_reason"] = (
+            "Configuration file '.streamlit/secrets.toml' does not exist. "
+            "Please copy '.streamlit/secrets.toml.example' to '.streamlit/secrets.toml' and enter credentials."
+        )
+        return None, diag
 
-        return creds
+    if not sec:
+        diag["error_reason"] = "Could not parse '[snowflake]' table from secrets.toml. Verify valid TOML syntax."
+        return None, diag
 
-    def has_valid_credentials(self) -> bool:
-        """Checks if Snowflake credentials are configured."""
-        creds = self.get_credentials()
-        return bool(
-            creds.get("account")
-            and creds.get("user")
-            and creds.get("password")
-            and creds.get("account") != "your_snowflake_account_id"
+    # Populate raw_fields with password masked
+    diag["raw_fields"] = {
+        k: ("*" * len(str(v)) if k == "password" else str(v))
+        for k, v in sec.items()
+    }
+
+    # Determine authentication method (defaults to standard 'snowflake' password auth)
+    auth_method = str(sec.get("authenticator", "snowflake")).strip().lower()
+
+    # Validate required fields: password is required for 'snowflake' auth, optional for 'externalbrowser'
+    required_keys = ["account", "user", "warehouse"]
+    if auth_method in ("snowflake", ""):
+        required_keys.append("password")
+
+    optional_keys = ["database", "schema", "role", "authenticator"]
+
+    for k in required_keys:
+        val = sec.get(k)
+        if val is None or str(val).strip() == "":
+            diag["missing_keys"].append(k)
+        elif str(val).startswith("YOUR_"):
+            diag["placeholder_keys"].append(k)
+        else:
+            diag["configured_keys"].append(k)
+
+    for k in optional_keys:
+        val = sec.get(k)
+        if val is not None and str(val).strip() != "" and not str(val).startswith("YOUR_"):
+            diag["configured_keys"].append(k)
+
+    if diag["missing_keys"] or diag["placeholder_keys"]:
+        reasons = []
+        if diag["missing_keys"]:
+            reasons.append(f"Missing required fields: {', '.join(diag['missing_keys'])}")
+        if diag["placeholder_keys"]:
+            reasons.append(f"Fields still set to placeholder values: {', '.join(diag['placeholder_keys'])}")
+        diag["error_reason"] = " | ".join(reasons)
+        return None, diag
+
+    # Clean account identifier
+    raw_acc = str(sec.get("account")).strip()
+    cleaned_acc = clean_account_identifier(raw_acc)
+
+    cfg = {
+        "account": cleaned_acc,
+        "user": str(sec.get("user")).strip(),
+        "password": str(sec.get("password", "")),
+        "warehouse": str(sec.get("warehouse")).strip(),
+        "database": str(sec.get("database", DEFAULT_DATABASE)).strip(),
+        "schema": str(sec.get("schema", DEFAULT_SCHEMA)).strip(),
+        "role": str(sec.get("role", "")).strip() or None,
+        "authenticator": auth_method,
+    }
+
+    return cfg, diag
+
+
+def get_snowflake_config() -> Optional[Dict[str, Any]]:
+    """
+    Retrieve Snowflake credentials if properly configured.
+    Never hardcodes credentials or creates synthetic connections.
+    """
+    cfg, _ = get_snowflake_config_diagnostics()
+    return cfg
+
+
+def get_connection(config: Dict[str, Any] = None):
+    """
+    Create a new Snowflake connection with strict timeouts.
+    """
+    cfg = config or get_snowflake_config()
+    if not cfg:
+        raise ValueError("Snowflake credentials are not configured in .streamlit/secrets.toml")
+
+    conn_kwargs = {
+        "user": cfg["user"],
+        "account": cfg["account"],
+        "warehouse": cfg["warehouse"],
+        "database": cfg.get("database", DEFAULT_DATABASE),
+        "schema": cfg.get("schema", DEFAULT_SCHEMA),
+        "login_timeout": 20,
+        "network_timeout": 30,
+        "client_session_keep_alive": False,
+        "enable_server_session_keep_alive_auto_detection": False,
+        "session_parameters": {
+            "STATEMENT_TIMEOUT_IN_SECONDS": QUERY_TIMEOUT_SECONDS,
+            "QUERY_TAG": "DataLens_Live_Streamlit",
+        }
+    }
+    if cfg.get("password"):
+        conn_kwargs["password"] = cfg["password"]
+    if cfg.get("authenticator") and cfg["authenticator"] != "snowflake":
+        conn_kwargs["authenticator"] = cfg["authenticator"]
+    if cfg.get("role"):
+        conn_kwargs["role"] = cfg["role"]
+
+    return snowflake.connector.connect(**conn_kwargs)
+
+
+def classify_snowflake_error(e: Exception) -> Tuple[str, str, str]:
+    """
+    Safely categorize Snowflake connector errors without exposing credentials.
+    Returns:
+        (category: str, code: str, recommendation: str)
+    """
+    err_text = e.msg if hasattr(e, 'msg') else str(e)
+    errno = str(getattr(e, 'errno', 'UNKNOWN'))
+
+    if "390102" in err_text or errno == "390102" or "temporarily locked" in err_text:
+        return (
+            "ACCOUNT_TEMPORARILY_LOCKED",
+            "390102",
+            (
+                "Your Snowflake user account has been temporarily locked by Snowflake's security policy "
+                "due to multiple consecutive failed password attempts.\n"
+                "  1. [Automatic Unlock]: Snowflake accounts automatically unlock after 15 minutes.\n"
+                "  2. [Immediate Snowsight Unlock]: If you are logged in to the Snowflake Web UI (Snowsight), "
+                "open a Worksheet and run:\n"
+                "       ALTER USER CURRENT_USER() SET MINS_TO_UNLOCK = 0;\n"
+                "  3. [Browser-based SSO]: If you use Google or SSO to log in, add 'authenticator = \"externalbrowser\"' "
+                "in .streamlit/secrets.toml."
+            )
+        )
+    elif "390100" in err_text or errno == "390100" or "Incorrect username or password" in err_text:
+        return (
+            "AUTHENTICATION_CREDENTIAL_OR_MFA_MISMATCH",
+            "390100",
+            (
+                "Snowflake rejected the username or password. Key diagnostic possibilities:\n"
+                "  1. [Login Name vs User Name]: In Snowflake, your LOGIN_NAME might be your email address. "
+                "Check by logging into Snowsight and inspecting 'DESC USER CURRENT_USER();'.\n"
+                "  2. [SSO / Google Sign-In]: If your account uses 'Sign in with Google' or Microsoft SSO, native password "
+                "auth is disabled. Set 'authenticator = \"externalbrowser\"' in .streamlit/secrets.toml.\n"
+                "  3. [MFA Enforced]: If Multi-Factor Authentication is enrolled for your user, password-only "
+                "connector login is blocked. Set 'authenticator = \"externalbrowser\"' to log in via browser."
+            )
+        )
+    elif "250001" in err_text or "404 Not Found" in err_text:
+        return (
+            "ACCOUNT_ENDPOINT_NOT_FOUND",
+            "250001",
+            "The account identifier host does not exist or returned 404. Verify account identifier in Snowsight."
+        )
+    elif "warehouse" in err_text.lower():
+        return (
+            "WAREHOUSE_CONFIGURATION_ERROR",
+            errno,
+            "Warehouse is inactive, not found, or user lacks USAGE privilege."
+        )
+    return (
+        "GENERAL_DATABASE_ERROR",
+        errno,
+        f"Database error ({errno}): {err_text}"
+    )
+
+
+def test_connection() -> Tuple[bool, Dict[str, Any], str]:
+    """
+    Test Snowflake connectivity with a small, inexpensive query:
+    SELECT CURRENT_VERSION(), CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ROLE()
+    Returns:
+        (is_connected: bool, info_dict: dict, error_message: str)
+    """
+    cfg, diag = get_snowflake_config_diagnostics()
+    if not cfg:
+        reason = diag.get("error_reason", "Credentials missing.")
+        return (
+            False,
+            {},
+            f"{reason}"
         )
 
-    def test_connection(self) -> Tuple[bool, str]:
-        """Tests live connection to Snowflake."""
-        if not SNOWFLAKE_AVAILABLE:
-            return False, "snowflake-connector-python package is not installed."
-
-        if not self.has_valid_credentials():
-            return False, "Snowflake credentials are not configured in .streamlit/secrets.toml or environment variables."
-
-        creds = self.get_credentials()
-        try:
-            ctx = snowflake.connector.connect(
-                account=creds["account"],
-                user=creds["user"],
-                password=creds["password"],
-                warehouse=creds.get("warehouse"),
-                database=creds.get("database", DEFAULT_DATABASE),
-                schema=creds.get("schema", DEFAULT_SCHEMA),
-                role=creds.get("role"),
-                login_timeout=10,
-            )
-            cur = ctx.cursor()
-            cur.execute("SELECT CURRENT_VERSION()")
-            ver = cur.fetchone()[0]
-            cur.close()
-            ctx.close()
-            return True, f"Successfully connected to Snowflake (Version: {ver})."
-        except Exception as e:
-            return False, f"Snowflake connection failed: {str(e)}"
-
-    def get_connection_status(self) -> Dict[str, Any]:
-        """Returns structured connection status dictionary."""
-        is_live = False
-        message = ""
-        creds = self.get_credentials()
-
-        if self.has_valid_credentials():
-            is_live, message = self.test_connection()
-
-        if is_live:
-            return {
-                "mode": "Live Snowflake",
-                "is_live": True,
-                "is_demo": False,
-                "database": creds.get("database", DEFAULT_DATABASE),
-                "schema": creds.get("schema", DEFAULT_SCHEMA),
-                "account": creds.get("account", "Configured"),
-                "warehouse": creds.get("warehouse", "COMPUTE_WH"),
-                "status_label": "Connected (Snowflake)",
-                "banner_needed": False,
-                "message": message,
-            }
-        else:
-            return {
-                "mode": "Demo Mode",
-                "is_live": False,
-                "is_demo": True,
-                "database": "DEMO_SNOWFLAKE_SAMPLE_DATA",
-                "schema": "TPCDS_SF10TCL_DEMO",
-                "account": "Local Synthetic Engine",
-                "warehouse": "DEMO_WH",
-                "status_label": "Demo Mode (Local Data)",
-                "banner_needed": True,
-                "message": message if message else "No live credentials provided. Running in high-fidelity Demo Mode.",
-            }
-
-    def execute_query(self, sql: str, timeout_seconds: int = 30) -> Tuple[pd.DataFrame, float, bool, Optional[str]]:
-        """
-        Executes an approved SQL query against Snowflake or fallback Demo engine.
-
-        Returns:
-            Tuple[pd.DataFrame, float, bool, Optional[str]]:
-                (results_dataframe, duration_seconds, is_demo_data, error_message)
-        """
-        start_time = time.time()
-        conn_status = self.get_connection_status()
-
-        if conn_status["is_live"]:
-            creds = self.get_credentials()
-            try:
-                ctx = snowflake.connector.connect(
-                    account=creds["account"],
-                    user=creds["user"],
-                    password=creds["password"],
-                    warehouse=creds.get("warehouse"),
-                    database=creds.get("database", DEFAULT_DATABASE),
-                    schema=creds.get("schema", DEFAULT_SCHEMA),
-                    role=creds.get("role"),
-                    network_timeout=timeout_seconds,
+    start_time = time.time()
+    try:
+        with get_connection(cfg) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT CURRENT_VERSION(), CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ROLE()"
                 )
-                cur = ctx.cursor()
+                row = cur.fetchone()
+                latency_ms = round((time.time() - start_time) * 1000, 1)
+                
+                info = {
+                    "version": row[0] if row else "Unknown",
+                    "warehouse": row[1] if row else cfg.get("warehouse"),
+                    "database": row[2] if row else cfg.get("database"),
+                    "schema": row[3] if row else cfg.get("schema"),
+                    "role": row[4] if row else cfg.get("role", "N/A"),
+                    "latency_ms": latency_ms,
+                    "account": cfg.get("account"),
+                    "user": cfg.get("user"),
+                    "authenticator": cfg.get("authenticator", "snowflake"),
+                }
+                return True, info, ""
+    except (DatabaseError, ProgrammingError, OperationalError) as e:
+        category, code, recommendation = classify_snowflake_error(e)
+        err_msg = (
+            f"Snowflake Connector Error [{code}] ({category}): "
+            f"{e.msg if hasattr(e, 'msg') else str(e)}\n\n"
+            f"Recommendations:\n{recommendation}"
+        )
+        return False, {"error_category": category, "error_code": code}, err_msg
+    except Exception as e:
+        return False, {"error_category": "UNEXPECTED_ERROR"}, f"Snowflake Connection Failed: {str(e)}"
+
+
+def execute_snowflake_query(sql: str, max_rows: int = 100) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """
+    Execute a validated SELECT query against Snowflake and return a Pandas DataFrame.
+
+    Returns:
+        (df: pd.DataFrame or None, execution_time_sec: float, error_message: str)
+    """
+    cfg = get_snowflake_config()
+    if not cfg:
+        return None, 0.0, "Credentials missing. Configure .streamlit/secrets.toml first."
+
+    start_time = time.time()
+    try:
+        with get_connection(cfg) as conn:
+            with conn.cursor() as cur:
                 cur.execute(sql)
-                col_names = [desc[0] for desc in cur.description] if cur.description else []
-                rows = cur.fetchall()
-                df = pd.DataFrame(rows, columns=col_names)
-                cur.close()
-                ctx.close()
-
-                duration = time.time() - start_time
-                return df, duration, False, None
-            except Exception as e:
-                # Live failed - fallback to demo engine with error notice
-                err = str(e)
-                print(f"Snowflake query execution error: {err}. Falling back to demo mode.")
-                df, dur, _, _ = self._execute_demo_query(sql)
-                return df, dur, True, f"Live query failed ({err}). Showing Demo results."
-
-        # Demo mode execution
-        df, duration, is_demo, err = self._execute_demo_query(sql)
-        return df, duration, is_demo, err
-
-    def _execute_demo_query(self, sql: str) -> Tuple[pd.DataFrame, float, bool, Optional[str]]:
-        """Executes query in the local DuckDB demo engine with translation for TPC-DS schema."""
-        start_time = time.time()
-        if self._demo_conn is None:
-            self._init_demo_engine()
-
-        # Sanitize snowflake-specific prefixes: remove 'SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.'
-        translated_sql = sql.replace("SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.", "")
-        translated_sql = translated_sql.replace("snowflake_sample_data.tpcds_sf10tcl.", "")
-
-        try:
-            df = self._demo_conn.execute(translated_sql).fetchdf()
-            duration = time.time() - start_time
-            return df, duration, True, None
-        except Exception as e:
-            # If standard query failed, attempt query against consolidated demo_retail_data
-            try:
-                # Fallback to consolidated query if complex join failed in demo
-                simple_fallback = "SELECT date, channel, item_name, category, quantity, unit_price, sales_amount, net_profit FROM demo_retail_data LIMIT 50"
-                df = self._demo_conn.execute(simple_fallback).fetchdf()
-                duration = time.time() - start_time
-                return df, duration, True, f"Direct query note: {str(e)}. Displayed demo retail records."
-            except Exception as e2:
-                duration = time.time() - start_time
-                return pd.DataFrame(), duration, True, f"Demo engine execution error: {str(e)}"
-
-    def get_available_tables(self) -> List[str]:
-        """Returns approved tables list."""
-        return APPROVED_TABLES
-
-    def get_table_schema(self, table_name: str) -> pd.DataFrame:
-        """Returns columns and types for a given table."""
-        tbl = table_name.upper()
-        if tbl not in APPROVED_TABLES:
-            return pd.DataFrame()
-
-        # Check if live
-        status = self.get_connection_status()
-        if status["is_live"]:
-            try:
-                sql = f"DESCRIBE TABLE {tbl}"
-                df, _, _, err = self.execute_query(sql)
-                if not err and not df.empty:
-                    return df[["name", "type", "null?", "default", "comment"]]
-            except Exception:
-                pass
-
-        # Demo schema definitions
-        schemas = {
-            "STORE_SALES": [
-                {"Column": "ss_sold_date_sk", "Type": "INTEGER", "Description": "Date foreign key (DATE_DIM.d_date_sk)"},
-                {"Column": "ss_item_sk", "Type": "INTEGER", "Description": "Item foreign key (ITEM.i_item_sk)"},
-                {"Column": "ss_customer_sk", "Type": "INTEGER", "Description": "Customer key (CUSTOMER.c_customer_sk)"},
-                {"Column": "ss_quantity", "Type": "INTEGER", "Description": "Number of units sold"},
-                {"Column": "ss_wholesale_cost", "Type": "DECIMAL(7,2)", "Description": "Wholesale acquisition cost per unit"},
-                {"Column": "ss_list_price", "Type": "DECIMAL(7,2)", "Description": "Catalog / MSRP list price"},
-                {"Column": "ss_sales_price", "Type": "DECIMAL(7,2)", "Description": "Actual sales price charged"},
-                {"Column": "ss_ext_sales_price", "Type": "DECIMAL(7,2)", "Description": "Extended sales amount (total revenue)"},
-                {"Column": "ss_net_profit", "Type": "DECIMAL(7,2)", "Description": "Net profit margin"},
-            ],
-            "WEB_SALES": [
-                {"Column": "ws_sold_date_sk", "Type": "INTEGER", "Description": "Date foreign key (DATE_DIM.d_date_sk)"},
-                {"Column": "ws_item_sk", "Type": "INTEGER", "Description": "Item foreign key (ITEM.i_item_sk)"},
-                {"Column": "ws_bill_customer_sk", "Type": "INTEGER", "Description": "Billing customer key"},
-                {"Column": "ws_quantity", "Type": "INTEGER", "Description": "Number of units sold online"},
-                {"Column": "ws_wholesale_cost", "Type": "DECIMAL(7,2)", "Description": "Wholesale acquisition cost"},
-                {"Column": "ws_list_price", "Type": "DECIMAL(7,2)", "Description": "Online list price"},
-                {"Column": "ws_sales_price", "Type": "DECIMAL(7,2)", "Description": "Actual online selling price"},
-                {"Column": "ws_ext_sales_price", "Type": "DECIMAL(7,2)", "Description": "Extended web sales amount"},
-                {"Column": "ws_net_profit", "Type": "DECIMAL(7,2)", "Description": "Net profit margin"},
-            ],
-            "CATALOG_SALES": [
-                {"Column": "cs_sold_date_sk", "Type": "INTEGER", "Description": "Date foreign key (DATE_DIM.d_date_sk)"},
-                {"Column": "cs_item_sk", "Type": "INTEGER", "Description": "Item foreign key (ITEM.i_item_sk)"},
-                {"Column": "cs_bill_customer_sk", "Type": "INTEGER", "Description": "Customer identifier"},
-                {"Column": "cs_quantity", "Type": "INTEGER", "Description": "Number of units ordered via catalog"},
-                {"Column": "cs_wholesale_cost", "Type": "DECIMAL(7,2)", "Description": "Wholesale unit cost"},
-                {"Column": "cs_list_price", "Type": "DECIMAL(7,2)", "Description": "Catalog list price"},
-                {"Column": "cs_sales_price", "Type": "DECIMAL(7,2)", "Description": "Final catalog sales price"},
-                {"Column": "cs_ext_sales_price", "Type": "DECIMAL(7,2)", "Description": "Extended catalog revenue"},
-                {"Column": "cs_net_profit", "Type": "DECIMAL(7,2)", "Description": "Catalog net profit"},
-            ],
-            "ITEM": [
-                {"Column": "i_item_sk", "Type": "INTEGER", "Description": "Unique item surrogate key"},
-                {"Column": "i_item_id", "Type": "VARCHAR(16)", "Description": "Item product code / SKU"},
-                {"Column": "i_product_name", "Type": "VARCHAR(128)", "Description": "Full product title"},
-                {"Column": "i_item_desc", "Type": "VARCHAR(256)", "Description": "Product details description"},
-                {"Column": "i_category", "Type": "VARCHAR(50)", "Description": "Merchandise category"},
-                {"Column": "i_brand", "Type": "VARCHAR(50)", "Description": "Manufacturer brand"},
-                {"Column": "i_class", "Type": "VARCHAR(50)", "Description": "Merchandise classification"},
-                {"Column": "i_current_price", "Type": "DECIMAL(7,2)", "Description": "Current selling price"},
-                {"Column": "i_wholesale_cost", "Type": "DECIMAL(7,2)", "Description": "Wholesale cost"},
-            ],
-            "CUSTOMER": [
-                {"Column": "c_customer_sk", "Type": "INTEGER", "Description": "Unique customer surrogate key"},
-                {"Column": "c_customer_id", "Type": "VARCHAR(16)", "Description": "Customer account ID"},
-                {"Column": "c_first_name", "Type": "VARCHAR(64)", "Description": "Given name"},
-                {"Column": "c_last_name", "Type": "VARCHAR(64)", "Description": "Family name"},
-                {"Column": "c_email_address", "Type": "VARCHAR(128)", "Description": "Contact email address"},
-            ],
-            "DATE_DIM": [
-                {"Column": "d_date_sk", "Type": "INTEGER", "Description": "Date surrogate key (YYYYMMDD)"},
-                {"Column": "d_date_id", "Type": "VARCHAR(16)", "Description": "Date string"},
-                {"Column": "d_date", "Type": "DATE", "Description": "Calendar date"},
-                {"Column": "d_year", "Type": "INTEGER", "Description": "Calendar year"},
-                {"Column": "d_moy", "Type": "INTEGER", "Description": "Month of year (1-12)"},
-                {"Column": "d_dom", "Type": "INTEGER", "Description": "Day of month (1-31)"},
-                {"Column": "d_qoy", "Type": "INTEGER", "Description": "Quarter of year (1-4)"},
-                {"Column": "d_month_name", "Type": "VARCHAR(16)", "Description": "Full month name (e.g. October)"},
-                {"Column": "d_holiday", "Type": "CHAR(1)", "Description": "Holiday indicator (Y/N)"},
-                {"Column": "d_weekend", "Type": "CHAR(1)", "Description": "Weekend indicator (Y/N)"},
-            ],
-        }
-
-        if tbl in schemas:
-            return pd.DataFrame(schemas[tbl])
-        return pd.DataFrame()
-
-    def preview_table(self, table_name: str, limit: int = 10) -> Tuple[pd.DataFrame, bool, Optional[str]]:
-        """Safely fetches top N rows of an approved table with LIMIT enforcement."""
-        tbl = table_name.upper()
-        if tbl not in APPROVED_TABLES:
-            return pd.DataFrame(), True, f"Table '{table_name}' is not an approved retail table."
-
-        sql = f"SELECT * FROM {tbl} LIMIT {min(limit, 50)}"
-        df, _, is_demo, err = self.execute_query(sql)
-        return df, is_demo, err
+                # Fetch results up to max_rows
+                rows = cur.fetchmany(max_rows)
+                columns = [col[0] for col in cur.description] if cur.description else []
+                df = pd.DataFrame(rows, columns=columns)
+                elapsed = round(time.time() - start_time, 2)
+                return df, elapsed, ""
+    except (DatabaseError, ProgrammingError, OperationalError) as e:
+        elapsed = round(time.time() - start_time, 2)
+        error_msg = e.msg if hasattr(e, 'msg') else str(e)
+        return None, elapsed, f"Snowflake execution error: {error_msg}"
+    except Exception as e:
+        elapsed = round(time.time() - start_time, 2)
+        return None, elapsed, f"Unexpected error during query execution: {str(e)}"
 
 
-# Global singleton instance
-snowflake_service = SnowflakeService()
+def inspect_schema(database: str = DEFAULT_DATABASE, schema: str = DEFAULT_SCHEMA) -> Dict[str, List[str]]:
+    """
+    Inspect the actual available tables and column names in Snowflake.
+    Does not assume tables or columns exist.
+    """
+    cfg = get_snowflake_config()
+    if not cfg:
+        return {}
+
+    db = database or cfg.get("database", DEFAULT_DATABASE)
+    sch = schema or cfg.get("schema", DEFAULT_SCHEMA)
+
+    query = f"""
+    SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+    FROM {db}.INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = '{sch.upper()}'
+    ORDER BY TABLE_NAME, ORDINAL_POSITION
+    """
+
+    df, _, err = execute_snowflake_query(query, max_rows=1000)
+    if df is None or df.empty:
+        # Fallback to SHOW TABLES if INFORMATION_SCHEMA access is restricted
+        tables_query = f"SHOW TABLES IN SCHEMA {db}.{sch}"
+        tdf, _, terr = execute_snowflake_query(tables_query, max_rows=100)
+        if tdf is not None and not tdf.empty:
+            tbl_col = "name" if "name" in tdf.columns else tdf.columns[1]
+            return {tbl: [] for tbl in tdf[tbl_col].tolist()}
+        return {}
+
+    schema_map: Dict[str, List[str]] = {}
+    for _, row in df.iterrows():
+        tname = str(row["TABLE_NAME"]).upper()
+        cname = str(row["COLUMN_NAME"]).upper()
+        if tname not in schema_map:
+            schema_map[tname] = []
+        schema_map[tname].append(cname)
+
+    return schema_map

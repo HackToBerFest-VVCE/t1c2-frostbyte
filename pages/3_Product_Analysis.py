@@ -1,145 +1,123 @@
-"""
-Product Analysis Page for DataLens.
-Provides SKU-level analysis, top 10 rankings by sales and volume, product search,
-and catalog inventory comparisons.
+"""Product Analysis Page — Deep Dive into Product Leaderboards and Category Performance.
 """
 
 import streamlit as st
-import pandas as pd
 import plotly.express as px
-from utils.config import get_custom_css, COLORS, APP_NAME
-from components.sidebar import render_sidebar
-from components.metric_cards import render_demo_banner
-from components.charts import render_top_products_chart, BASE_LAYOUT
-from services.analytics_service import analytics_service
-from utils.formatting import format_currency, format_number
+import pandas as pd
 
-# Page Setup
+from services.ui_theme import (
+    apply_theme,
+    render_hero_banner,
+    render_metric_card,
+    apply_plotly_theme,
+    COLOR_PRIMARY_BLUE,
+    COLOR_PURPLE,
+    COLOR_CARD,
+    COLOR_BORDER,
+    COLOR_DARK_NAVY,
+)
+from services.snowflake_service import (
+    test_connection,
+    get_snowflake_config,
+    DEFAULT_DATABASE,
+    DEFAULT_SCHEMA,
+)
+from services.analytics_service import (
+    get_top_products,
+    get_category_performance,
+)
+
 st.set_page_config(
-    page_title=f"Product Analysis — {APP_NAME}",
-    page_icon="🏷️",
+    page_title="Product Analysis — DataLens Live",
+    page_icon="📦",
     layout="wide",
 )
-st.markdown(get_custom_css(), unsafe_allow_html=True)
-render_sidebar(active_page="Product Analysis")
+apply_theme()
 
-# Header
-st.markdown(
-    f"""
-    <div>
-        <h1 style="font-size: 2rem; font-weight: 800; color: {COLORS['text']}; margin: 0;">
-            🏷️ Product & Inventory Analysis
-        </h1>
-        <p style="font-size: 0.95rem; color: #64748B; margin-top: 4px; margin-bottom: 20px;">
-            Inspect SKU performance, compare sales revenue against units sold, and search catalog items.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+cfg = get_snowflake_config()
+is_connected = False
+if cfg:
+    is_connected, _, _ = test_connection()
+
+active_db = cfg.get("database", DEFAULT_DATABASE) if cfg else DEFAULT_DATABASE
+active_sch = cfg.get("schema", DEFAULT_SCHEMA) if cfg else DEFAULT_SCHEMA
+
+render_hero_banner(
+    title="Product & Category Analytics",
+    subtitle="Identify high-velocity items, top-grossing categories, and margin performance",
+    data_source=f"{active_db}.{active_sch}",
+    connected=is_connected
 )
 
-# Search and Filters Card
-col_search, col_cat = st.columns([3, 2])
-with col_search:
-    search_keyword = st.text_input("Search Product or Brand:", placeholder="e.g. OLED, ApexTech, Parka, Espresso...")
-with col_cat:
-    categories = analytics_service.get_categories()
-    chosen_cat = st.selectbox("Filter Category:", options=categories, index=0)
+if not is_connected:
+    st.warning("⚠️ **Live Snowflake Connection Required**")
+    st.info("Configure your credentials in `.streamlit/secrets.toml` to access live Snowflake product analytics.")
+    st.stop()
 
-# Fetch Product Data
-with st.spinner("Analyzing product performance..."):
-    prod_data = analytics_service.get_product_analytics(
-        search_term=search_keyword, category_filter=chosen_cat
+# Controls
+c1, c2 = st.columns([1, 1])
+with c1:
+    selected_year = st.selectbox("Select Year", options=[2000, 1999, 1998, 2001, 2002], index=0)
+with c2:
+    top_n = st.slider("Number of Top Products", min_value=5, max_value=25, value=10, step=5)
+
+# Section 1: Top Products
+st.markdown(f"### 🏆 Top {top_n} Revenue Generating Products")
+with st.spinner("Fetching top products from Snowflake..."):
+    prod_df, prod_time, prod_err = get_top_products(limit=top_n, year=selected_year)
+
+if prod_err:
+    st.error(f"Error querying top products: {prod_err}")
+elif prod_df is not None and not prod_df.empty:
+    fig_top = px.bar(
+        prod_df.sort_values("TOTAL_SALES", ascending=True),
+        x="TOTAL_SALES",
+        y="PRODUCT_NAME",
+        orientation="h",
+        color="CATEGORY",
+        text_auto="$,.2s",
+        title=f"Top {top_n} Products by Sales ({selected_year})",
+        labels={"TOTAL_SALES": "Sales ($)", "PRODUCT_NAME": "Product Name"},
+        color_discrete_sequence=[COLOR_PRIMARY_BLUE, COLOR_PURPLE, "#0284C7", "#38BDF8"]
     )
+    apply_plotly_theme(fig_top, height=450)
+    st.plotly_chart(fig_top, use_container_width=True)
 
-# Mandatory Demo Warning Banner
-render_demo_banner(prod_data["is_demo"])
+    with st.expander("📋 View Product Details Table", expanded=False):
+        t_df = prod_df.copy()
+        t_df["TOTAL_SALES"] = t_df["TOTAL_SALES"].map("${:,.2f}".format)
+        t_df["TOTAL_QUANTITY_SOLD"] = t_df["TOTAL_QUANTITY_SOLD"].map("{:,}".format)
+        st.dataframe(t_df, use_container_width=True, hide_index=True)
 
-# Two Top 10 Comparison Charts
-col_chart_sales, col_chart_qty = st.columns(2)
+# Section 2: Category Breakdown
+st.markdown("### 🏷️ Category Performance & Profitability")
+with st.spinner("Querying category breakdown..."):
+    cat_df, cat_time, cat_err = get_category_performance(year=selected_year)
 
-with col_chart_sales:
-    st.markdown(
-        f"""
-        <div class="datalens-card">
-            <div class="section-title">🏆 Top 10 Products by Revenue</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    df_sales = prod_data["top_sales"]
-    if not df_sales.empty:
-        fig_s = px.bar(
-            df_sales.sort_values(by="total_sales", ascending=True),
-            x="total_sales",
-            y="product_name",
-            orientation="h",
-            color="total_sales",
-            color_continuous_scale=[[0.0, "#A78BFA"], [1.0, COLORS["primary"]]],
-            labels={"total_sales": "Total Sales (USD)", "product_name": "Product"},
+if cat_err:
+    st.error(f"Error querying category performance: {cat_err}")
+elif cat_df is not None and not cat_df.empty:
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        fig_cat_sales = px.bar(
+            cat_df,
+            x="CATEGORY",
+            y="TOTAL_SALES",
+            color="TOTAL_SALES",
+            title=f"Total Sales by Category ({selected_year})",
+            color_continuous_scale=[[0, "#BAE6FD"], [1, COLOR_PRIMARY_BLUE]],
         )
-        fig_s.update_layout(**BASE_LAYOUT, coloraxis_showscale=False)
-        fig_s.update_traces(
-            hovertemplate="<b>%{y}</b><br>Sales: $%{x:,.2f}<extra></extra>",
-            marker=dict(cornerradius=4),
+        apply_plotly_theme(fig_cat_sales, height=380)
+        st.plotly_chart(fig_cat_sales, use_container_width=True)
+
+    with col_c2:
+        fig_cat_profit = px.bar(
+            cat_df,
+            x="CATEGORY",
+            y="NET_PROFIT",
+            color="NET_PROFIT",
+            title=f"Net Profit by Category ({selected_year})",
+            color_continuous_scale=[[0, "#E0E7FF"], [1, COLOR_PURPLE]],
         )
-        st.plotly_chart(fig_s, use_container_width=True)
-    else:
-        st.info("No matching products found.")
-
-with col_chart_qty:
-    st.markdown(
-        f"""
-        <div class="datalens-card">
-            <div class="section-title">📦 Top 10 Products by Volume (Units Sold)</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    df_qty = prod_data["top_qty"]
-    if not df_qty.empty:
-        fig_q = px.bar(
-            df_qty.sort_values(by="units_sold", ascending=True),
-            x="units_sold",
-            y="product_name",
-            orientation="h",
-            color="units_sold",
-            color_continuous_scale=[[0.0, "#BAE6FD"], [1.0, COLORS["highlight"]]],
-            labels={"units_sold": "Units Sold", "product_name": "Product"},
-        )
-        fig_q.update_layout(**BASE_LAYOUT, coloraxis_showscale=False)
-        fig_q.update_traces(
-            hovertemplate="<b>%{y}</b><br>Units Sold: %{x:,}<extra></extra>",
-            marker=dict(cornerradius=4),
-        )
-        st.plotly_chart(fig_q, use_container_width=True)
-    else:
-        st.info("No matching products found.")
-
-st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
-
-# Product Catalog & Performance Comparison Table
-st.markdown(
-    f"""
-    <div class="datalens-card">
-        <div class="section-title">📋 Product Catalog Performance Matrix</div>
-        <p style="font-size: 0.85rem; color: #64748B; margin-bottom: 12px;">
-            Complete list of retail inventory SKUs with unit pricing, lifetime unit sales, and gross revenue generated.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-df_catalog = prod_data["catalog"]
-if not df_catalog.empty:
-    st.dataframe(df_catalog, use_container_width=True)
-    csv_cat = df_catalog.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Download Product Matrix CSV",
-        data=csv_cat,
-        file_name="product_analysis_matrix.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("No products match the filter criteria.")
+        apply_plotly_theme(fig_cat_profit, height=380)
+        st.plotly_chart(fig_cat_profit, use_container_width=True)

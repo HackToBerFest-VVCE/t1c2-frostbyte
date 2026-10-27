@@ -1,180 +1,152 @@
-"""
-Sales Analytics Page for DataLens.
-Provides deep-dive sales reporting, multi-channel breakdowns, category filters,
-and interactive visualisations.
+"""Sales Analytics Page — Deep Dive into Omnichannel Performance & Sales Trends.
 """
 
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
-from utils.config import get_custom_css, COLORS, APP_NAME
-from components.sidebar import render_sidebar
-from components.metric_cards import render_demo_banner
-from components.charts import (
-    render_sales_trend_chart,
-    render_category_bar_chart,
-    render_channel_comparison_chart,
-)
-from services.analytics_service import analytics_service
-from utils.formatting import format_currency, format_number
 
-# Page Config
+from services.ui_theme import (
+    apply_theme,
+    render_hero_banner,
+    render_metric_card,
+    apply_plotly_theme,
+    COLOR_PRIMARY_BLUE,
+    COLOR_PURPLE,
+    COLOR_CARD,
+    COLOR_BORDER,
+    COLOR_DARK_NAVY,
+)
+from services.snowflake_service import (
+    test_connection,
+    get_snowflake_config,
+    DEFAULT_DATABASE,
+    DEFAULT_SCHEMA,
+)
+from services.analytics_service import (
+    get_sales_trend_by_date,
+    get_omnichannel_comparison,
+    run_safe_query,
+)
+
 st.set_page_config(
-    page_title=f"Sales Analytics — {APP_NAME}",
+    page_title="Sales Analytics — DataLens Live",
     page_icon="📊",
     layout="wide",
 )
-st.markdown(get_custom_css(), unsafe_allow_html=True)
-render_sidebar(active_page="Sales Analytics")
+apply_theme()
 
-# Header
-st.markdown(
-    f"""
-    <div>
-        <h1 style="font-size: 2rem; font-weight: 800; color: {COLORS['text']}; margin: 0;">
-            📊 Sales Analytics & Multi-Channel Performance
-        </h1>
-        <p style="font-size: 0.95rem; color: #64748B; margin-top: 4px; margin-bottom: 20px;">
-            Analyze revenue generation across physical stores, digital web, and mail-order catalog channels.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+cfg = get_snowflake_config()
+is_connected = False
+if cfg:
+    is_connected, _, _ = test_connection()
+
+active_db = cfg.get("database", DEFAULT_DATABASE) if cfg else DEFAULT_DATABASE
+active_sch = cfg.get("schema", DEFAULT_SCHEMA) if cfg else DEFAULT_SCHEMA
+
+render_hero_banner(
+    title="Sales & Channel Analytics",
+    subtitle="Comparative breakdown of Store, Web, and Catalog sales with granular time-series analysis",
+    data_source=f"{active_db}.{active_sch}",
+    connected=is_connected
 )
 
-# Filter Bar (White Card)
-categories = analytics_service.get_categories()
+if not is_connected:
+    st.warning("⚠️ **Live Snowflake Connection Required**")
+    st.info("Configure your credentials in `.streamlit/secrets.toml` to access live Snowflake analytics.")
+    st.stop()
 
-st.markdown(
-    f"""
-    <div class="datalens-card" style="padding: 16px 20px; margin-bottom: 20px;">
-        <span style="font-size: 0.8rem; font-weight: 700; color: #64748B; text-transform: uppercase;">
-            🔍 Filters & Slicers
-        </span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# Controls
+col_ctrl1, col_ctrl2 = st.columns([1, 3])
+with col_ctrl1:
+    selected_year = st.selectbox("Select Year", options=[2000, 1999, 1998, 2001, 2002], index=0)
 
-col_f1, col_f2 = st.columns(2)
-with col_f1:
-    selected_cat = st.selectbox("Product Category Filter", options=categories, index=0)
-with col_f2:
-    selected_year = st.selectbox("Calendar Year", options=["All Years", 2024, 2025], index=0)
+# Section 1: Omnichannel Comparison
+st.markdown("### 🌐 Omnichannel Sales Comparison")
+with st.spinner("Executing channel aggregation query across Store, Web, and Catalog..."):
+    chan_df, chan_time, chan_err = get_omnichannel_comparison(year=selected_year)
 
-year_val = None if selected_year == "All Years" else int(selected_year)
+if chan_err:
+    st.error(f"Error querying channels: {chan_err}")
+elif chan_df is not None and not chan_df.empty:
+    total_omni_sales = chan_df["SALES"].sum()
+    total_omni_qty = chan_df["QUANTITY"].sum()
 
-# Fetch data with filters
-with st.spinner("Calculating sales analytics..."):
-    data = analytics_service.get_sales_analytics(
-        selected_category=selected_cat, year_filter=year_val
-    )
+    mcol1, mcol2, mcol3 = st.columns(3)
+    with mcol1:
+        render_metric_card("Total Combined Sales", f"${total_omni_sales:,.2f}", f"Year {selected_year} All Channels")
+    with mcol2:
+        render_metric_card("Total Units Moved", f"{total_omni_qty:,} units", "Store + Web + Catalog")
+    with mcol3:
+        leader = chan_df.loc[chan_df["SALES"].idxmax()]["CHANNEL"]
+        render_metric_card("Leading Channel", f"{leader}", "By total revenue")
 
-# Mandatory Demo Warning Banner
-render_demo_banner(data["is_demo"])
-
-# KPI Metrics Summary Row
-df_summary = data["summary"]
-if not df_summary.empty:
-    row = df_summary.iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns([3, 2])
     with c1:
-        st.markdown(
-            f"""
-            <div class="kpi-card" style="border-top-color: {COLORS['primary']};">
-                <div class="kpi-label">Filtered Sales</div>
-                <div class="kpi-value">{format_currency(row.get('total_sales', 0))}</div>
-                <div class="kpi-subtext">Category: {selected_cat}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        fig_bar = px.bar(
+            chan_df,
+            x="CHANNEL",
+            y="SALES",
+            color="CHANNEL",
+            text_auto="$,.2s",
+            title=f"Total Revenue by Sales Channel ({selected_year})",
+            color_discrete_map={
+                "Store Sales": COLOR_PRIMARY_BLUE,
+                "Web Sales": COLOR_PURPLE,
+                "Catalog Sales": "#0284C7"
+            }
         )
+        apply_plotly_theme(fig_bar, height=350)
+        fig_bar.update_layout(showlegend=False)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
     with c2:
-        st.markdown(
-            f"""
-            <div class="kpi-card" style="border-top-color: {COLORS['highlight']};">
-                <div class="kpi-label">Units Sold</div>
-                <div class="kpi-value">{format_number(row.get('total_quantity', 0))}</div>
-                <div class="kpi-subtext">Volume moved</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        fig_pie = px.pie(
+            chan_df,
+            names="CHANNEL",
+            values="SALES",
+            title=f"Channel Market Share ({selected_year})",
+            color="CHANNEL",
+            hole=0.45,
+            color_discrete_map={
+                "Store Sales": COLOR_PRIMARY_BLUE,
+                "Web Sales": COLOR_PURPLE,
+                "Catalog Sales": "#0284C7"
+            }
         )
-    with c3:
-        st.markdown(
-            f"""
-            <div class="kpi-card" style="border-top-color: #0284C7;">
-                <div class="kpi-label">Transactions</div>
-                <div class="kpi-value">{format_number(row.get('total_transactions', 0))}</div>
-                <div class="kpi-subtext">Order line items</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c4:
-        st.markdown(
-            f"""
-            <div class="kpi-card" style="border-top-color: #38BDF8;">
-                <div class="kpi-label">Average Order Value</div>
-                <div class="kpi-value">{format_currency(row.get('avg_order_value', 0))}</div>
-                <div class="kpi-subtext">Revenue per transaction</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        apply_plotly_theme(fig_pie, height=350)
+        st.plotly_chart(fig_pie, use_container_width=True)
 
-st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
+# Section 2: Daily Sales Trends
+st.markdown("### 📈 Daily Sales Trend & Moving Average")
+with st.spinner("Fetching daily sales time-series from Snowflake..."):
+    trend_df, trend_time, trend_err = get_sales_trend_by_date(year=selected_year)
 
-# Visualisations Row
-col_c1, col_c2 = st.columns([3, 2])
+if trend_err:
+    st.error(f"Error loading sales trend: {trend_err}")
+elif trend_df is not None and not trend_df.empty:
+    trend_df["SALE_DATE"] = pd.to_datetime(trend_df["SALE_DATE"])
+    trend_df = trend_df.sort_values("SALE_DATE")
+    trend_df["7_DAY_MA"] = trend_df["DAILY_SALES"].rolling(window=7, min_periods=1).mean()
 
-with col_c1:
-    st.markdown(
-        f"""
-        <div class="datalens-card">
-            <div class="section-title">📈 Sales Over Time (Monthly Trend)</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    fig_monthly = render_sales_trend_chart(data["monthly"])
-    st.plotly_chart(fig_monthly, use_container_width=True)
+    fig_ma = go.Figure()
+    fig_ma.add_trace(go.Scatter(
+        x=trend_df["SALE_DATE"],
+        y=trend_df["DAILY_SALES"],
+        mode="lines",
+        name="Daily Sales ($)",
+        line=dict(color="#BAE6FD", width=1.5),
+    ))
+    fig_ma.add_trace(go.Scatter(
+        x=trend_df["SALE_DATE"],
+        y=trend_df["7_DAY_MA"],
+        mode="lines",
+        name="7-Day Moving Avg ($)",
+        line=dict(color=COLOR_PRIMARY_BLUE, width=3),
+    ))
+    apply_plotly_theme(fig_ma, title=f"Daily Revenue & 7-Day Moving Average ({selected_year})", height=400)
+    st.plotly_chart(fig_ma, use_container_width=True)
 
-with col_c2:
-    st.markdown(
-        f"""
-        <div class="datalens-card">
-            <div class="section-title">🌐 Multi-Channel Revenue Comparison</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    fig_chan = render_channel_comparison_chart(data["channels"])
-    st.plotly_chart(fig_chan, use_container_width=True)
-
-st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
-
-# Product-Level Breakdown Table
-st.markdown(
-    f"""
-    <div class="datalens-card">
-        <div class="section-title">📋 Product-Level Performance Details</div>
-        <p style="font-size: 0.85rem; color: #64748B; margin-bottom: 14px;">
-            Detailed sales metrics, revenue contributions, and unit pricing per merchandise SKU.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-df_prod = data["products"]
-if not df_prod.empty:
-    st.dataframe(df_prod, use_container_width=True)
-    csv = df_prod.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Export Sales Breakdown CSV",
-        data=csv,
-        file_name="sales_analytics_breakdown.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("No records found for the selected category filter.")
+    with st.expander("📄 View Daily Sales Raw Data", expanded=False):
+        st.dataframe(trend_df, use_container_width=True)
